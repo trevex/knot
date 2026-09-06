@@ -93,9 +93,22 @@ CREATE INDEX notifications_unread ON notifications(user_id) WHERE read_at IS NUL
 
 ### 2. Emit
 
-A single `knot_storage::notifications::emit(&mut tx, Notification)` — takes an
-executor so callers already inside a transaction stay atomic with it. Emits
-where `actor_id = user_id` are dropped in `emit` itself, not at each call site.
+`NotificationStore::emit(&NewNotification)`, following the codebase's store
+convention: a trait behind `Arc<dyn …>` owning its own pool, wired in
+`AppState::with_pool`. Emits where `actor_id = user_id` are dropped inside
+`emit`, not at each call site.
+
+A trait object cannot accept a transaction, so the request-path emits (mention,
+reply, `doc_shared`) run **after** their write commits, exactly as today's
+`broadcast_mentions` does. A crash in the window between the two loses the
+notification. That is at-most-once, it is what ships today, and the alternative —
+generic executors, which `dyn` forbids — would restructure every store in the
+crate for a notification nobody is waiting on.
+
+`task_assigned` is the exception and does not go through the trait: it is written
+by a plain `INSERT … ON CONFLICT DO NOTHING` inside the transaction
+`upsert_for_doc` already opens, so a task's index row and its notification commit
+together or not at all.
 
 Five sources:
 
