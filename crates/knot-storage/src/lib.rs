@@ -9,6 +9,7 @@ pub mod grant_store;
 pub mod invalidations;
 pub mod lexorank;
 pub mod markdown_cache;
+pub mod notifications;
 pub mod pool;
 pub mod search;
 pub mod session_store;
@@ -28,6 +29,10 @@ pub use lexorank::between as sort_key_between;
 pub use markdown_cache::{
     MarkdownCacheEntry, MarkdownCacheError, MarkdownCacheStore, PgMarkdownCache,
 };
+pub use notifications::{
+    NewNotification, Notification, NotificationKind, NotificationStore, NotificationStoreError,
+    PgNotificationStore,
+};
 pub use pool::{Pool, PoolError, begin, connect};
 pub use search::{PgSearchStore, SearchHit, SearchStore, SearchStoreError};
 pub use session_store::{PgSessionStore, Session, SessionStore, SessionStoreError};
@@ -35,7 +40,9 @@ pub use share_tokens::{PgShareTokenStore, ShareStoreError, ShareToken, ShareToke
 pub use snapshot_store::{
     DocSnapshot, PgSnapshotStore, SnapshotMeta, SnapshotStore, SnapshotStoreError,
 };
-pub use tasks::{DocTask, DocTaskInput, PgTaskStore, TaskStore, TaskStoreError};
+pub use tasks::{
+    DocTask, DocTaskInput, PgTaskStore, TaskStore, TaskStoreError, task_assigned_dedupe_key,
+};
 pub use updates_store::{DocUpdate, PgUpdatesStore, UpdatesStore, UpdatesStoreError};
 pub use user_store::{PgUserStore, User, UserStore, UserStoreError};
 pub use workspace_store::{

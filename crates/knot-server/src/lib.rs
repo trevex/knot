@@ -12,10 +12,10 @@ use knot_auth::{Hasher, Throttle};
 use knot_config::Config;
 use knot_docs::AclCache;
 use knot_storage::{
-    BlobMeta, BlobStore, CommentStore, DocStore, GrantStore, MarkdownCacheStore, PgBytesStore,
-    PgCommentStore, PgDocStore, PgGrantStore, PgMarkdownCache, PgSearchStore, PgSessionStore,
-    PgShareTokenStore, PgUserStore, PgWorkspaceStore, Pool, SearchStore, SessionStore,
-    ShareTokenStore, UserStore, WorkspaceStore,
+    BlobMeta, BlobStore, CommentStore, DocStore, GrantStore, MarkdownCacheStore, NotificationStore,
+    PgBytesStore, PgCommentStore, PgDocStore, PgGrantStore, PgMarkdownCache, PgNotificationStore,
+    PgSearchStore, PgSessionStore, PgShareTokenStore, PgUserStore, PgWorkspaceStore, Pool,
+    SearchStore, SessionStore, ShareTokenStore, UserStore, WorkspaceStore,
 };
 use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
@@ -30,6 +30,7 @@ pub mod board_room_shim;
 pub mod comments_listener;
 pub mod http_error;
 pub mod metrics;
+pub mod notifications_sweep;
 pub mod protocol;
 pub mod reindex;
 pub mod room;
@@ -59,6 +60,7 @@ pub struct AppState {
     pub boards: Option<Arc<dyn knot_storage::BoardStore>>,
     pub board_rooms: Option<Arc<knot_crdt::BoardRooms>>,
     pub tasks: Option<Arc<dyn knot_storage::TaskStore>>,
+    pub notifications: Option<Arc<dyn NotificationStore>>,
     pub hasher: Arc<Hasher>,
     pub throttle: Arc<Throttle>,
     pub session_key: Vec<u8>,
@@ -95,6 +97,7 @@ impl AppState {
             boards: None,
             board_rooms: None,
             tasks: None,
+            notifications: None,
             hasher: Arc::new(Hasher::new()),
             throttle: Arc::new(Throttle::new()),
             session_key: Vec::new(),
@@ -136,6 +139,8 @@ impl AppState {
             Arc::new(knot_storage::PgBoardStore::new(pool.clone()));
         let tasks: Arc<dyn knot_storage::TaskStore> =
             Arc::new(knot_storage::PgTaskStore::new(pool.clone()));
+        let notifications: Arc<dyn NotificationStore> =
+            Arc::new(PgNotificationStore::new(pool.clone()));
         Self {
             pool: Some(pool),
             users: Some(users),
@@ -156,6 +161,7 @@ impl AppState {
             boards: Some(boards),
             board_rooms: None,
             tasks: Some(tasks),
+            notifications: Some(notifications),
             hasher: Arc::new(Hasher::new()),
             throttle: Arc::new(Throttle::new()),
             session_key: Vec::new(),

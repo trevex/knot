@@ -22,7 +22,7 @@ import {
   setEditorRef,
 } from "./CommentsHighlightExtension";
 import { EditorToolbar } from "./EditorToolbar";
-import { KnotProvider, type CommentChangeMsg, type MentionMsg, type ProviderStatus } from "./KnotProvider";
+import { KnotProvider, type CommentChangeMsg, type ProviderStatus } from "./KnotProvider";
 import { looksLikeMarkdown, markdownToHtml } from "./markdownPaste";
 
 type Pair = { doc: Y.Doc; provider: KnotProvider };
@@ -151,21 +151,6 @@ function EditorBody({ pair, role, docId, editMode }: { pair: Pair; role: "owner"
     update();
     return () => { provider.awareness.off("change", update); };
   }, [pair]);
-
-  // Subscribe to mention push events from the collab WS.
-  // NOTE: The server-side pg_notify → WS pipeline is not yet wired (T16 concern).
-  // This handler fires when the server eventually sends MSG_MENTION frames.
-  useEffect(() => {
-    const { provider } = pair;
-    const userId = sessionUser?.user_id;
-    const onMention = (msg: MentionMsg) => {
-      if (!userId || !msg.user_ids.includes(userId)) return;
-      notify("info", "You were mentioned in a comment.");
-      openCommentSidebar();
-    };
-    provider.on("mention", onMention);
-    return () => { provider.off("mention", onMention); };
-  }, [pair, sessionUser?.user_id, notify, openCommentSidebar]);
 
   // Invalidate the comments query when a peer pushes a MSG_COMMENTS frame,
   // causing the comment sidebar to refetch automatically.

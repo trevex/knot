@@ -52,7 +52,14 @@ pub fn spawn(state: AppState, mut rx: mpsc::Receiver<Uuid>) {
                     }
                     let to_flush = std::mem::take(&mut pending);
                     for doc_id in to_flush {
-                        if let Err(e) = refresh_markdown_and_index(&state, doc_id).await {
+                        // The dirty-notification channel carries only a
+                        // doc-id (see the module docs above), so there is
+                        // no editor identity to forward here. That means a
+                        // `task_assigned` notification triggered purely by
+                        // this worker's periodic flush has no actor — it
+                        // is never suppressed as a "self-assignment" and
+                        // never attributed to anyone in particular.
+                        if let Err(e) = refresh_markdown_and_index(&state, doc_id, None).await {
                             tracing::warn!(error=?e, %doc_id, "reindex worker: refresh failed");
                         }
                     }

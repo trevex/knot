@@ -1,0 +1,116 @@
+//! Periodic notification work: overdue tasks, and retention.
+//!
+//! Runs on every replica with no leader election. Both halves are safe to
+//! run concurrently — the overdue emit is `ON CONFLICT DO NOTHING` against
+//! `notifications_dedupe`, and the prune (delegated to
+//! `PgNotificationStore::prune`) is idempotent by construction.
+
+use chrono::{DateTime, Utc};
+use knot_storage::{NotificationStore, NotificationStoreError, PgNotificationStore};
+use sqlx::PgPool;
+use tokio::task::JoinHandle;
+
+const INTERVAL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SweepOutcome {
+    pub due_emitted: u64,
+    pub pruned: u64,
+}
+
+/// Emit `task_due` for every open, assigned, task that went overdue in the
+/// last 7 days, then prune.
+///
+/// The dedupe key is content-addressed exactly like `task_assigned`'s
+/// (`task_due:<doc_id>:<sha256(text)[..16]>:<assignee>:<date>`, computed with
+/// the same SQL sha256 expression `PgTaskStore` uses at
+/// `crates/knot-storage/src/tasks.rs`) rather than keyed on `doc_tasks.id`.
+/// `doc_tasks.id` is `"<doc_id>:<item_index>"`, so inserting a checklist
+/// item above an overdue one shifts every later item's id — an id-keyed
+/// dedupe key would treat that reorder as a brand-new task and re-notify
+/// every overdue assignee the same day. The date suffix still makes the key
+/// a pure function of `(task content, assignee, day)`, so an overdue task
+/// notifies once a day rather than once every fifteen minutes.
+///
+/// The `t.due_at > $1 - interval '7 days'` floor exists so that on an
+/// existing deployment — where `doc_tasks` already has rows with `due_at`
+/// stretching back to whenever the workspace was created, and
+/// `notifications` starts out empty — the first sweep after this feature
+/// ships does not treat every task that has *ever* been overdue as newly
+/// overdue and fire a `task_due` burst for the entire historical backlog.
+/// Only work that went overdue recently is worth a push; anything older
+/// than that is still visible on `/tasks` without a notification.
+pub async fn run_once(pool: &PgPool, now: DateTime<Utc>) -> Result<SweepOutcome, sqlx::Error> {
+    // The date half of the dedupe key is computed here, in Rust, from `now`
+    // — not with `to_char(...)` in SQL. `to_char` renders using the
+    // connection's session `TimeZone` GUC, which nothing in this repo ever
+    // sets; today every replica happens to inherit the same server default
+    // so the key is stable, but that's incidental, not enforced. Binding a
+    // pre-formatted date string makes the key a pure function of `now`,
+    // matching the design's claim that correctness lives entirely in the
+    // unique index, not in ambient session state.
+    let date = now.format("%Y-%m-%d").to_string();
+    let emitted = sqlx::query(
+        "INSERT INTO notifications \
+           (workspace_id, user_id, actor_id, kind, doc_id, target_kind, target_id, dedupe_key, data) \
+         SELECT t.workspace_id, t.assignee_user_id, NULL, 'task_due', t.doc_id, 'task', t.id, \
+                'task_due:' || t.doc_id || ':' || \
+                  encode(substring(sha256(convert_to(t.text, 'UTF8')) from 1 for 8), 'hex') || \
+                  ':' || t.assignee_user_id || ':' || $2, \
+                jsonb_build_object('excerpt', t.text, 'due_at', t.due_at) \
+         FROM doc_tasks t \
+         WHERE t.assignee_user_id IS NOT NULL \
+           AND t.checked = false \
+           AND t.due_at IS NOT NULL \
+           AND t.due_at < $1 \
+           AND t.due_at > $1 - interval '7 days' \
+         ON CONFLICT (user_id, dedupe_key) DO NOTHING",
+    )
+    .bind(now)
+    .bind(&date)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    // Retention is `PgNotificationStore::prune`'s rule, not a second copy of
+    // it — the store already implements "read rows die after 90 days, all
+    // rows after 180" for the inbox-mutation endpoints, and duplicating
+    // that DELETE here would leave two places to keep in sync.
+    // `prune` returns the store's own error type; unwrap to the `sqlx::Error`
+    // this function's signature carries — `NotificationStoreError` only
+    // ever wraps one.
+    let pruned = match PgNotificationStore::new(pool.clone()).prune(now).await {
+        Ok(n) => n,
+        Err(NotificationStoreError::Sqlx(e)) => return Err(e),
+    };
+
+    if emitted > 0 {
+        metrics::counter!("knot_notifications_emitted_total", "kind" => "task_due")
+            .increment(emitted);
+    }
+    Ok(SweepOutcome {
+        due_emitted: emitted,
+        pruned,
+    })
+}
+
+/// Spawn the 15-minute loop. One per process; every replica runs its own.
+pub fn spawn(pool: PgPool) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(INTERVAL);
+        // The first tick fires immediately; skip it so a rolling restart
+        // doesn't have every pod sweep at once on boot.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            match run_once(&pool, Utc::now()).await {
+                Ok(out) => tracing::debug!(
+                    due_emitted = out.due_emitted,
+                    pruned = out.pruned,
+                    "notification sweep"
+                ),
+                Err(e) => tracing::warn!(error=?e, "notification sweep failed"),
+            }
+        }
+    })
+}

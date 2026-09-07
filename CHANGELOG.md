@@ -8,6 +8,42 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
 
 ## [Unreleased]
 
+### Added
+- **Notifications and an inbox.** An `@mention` in a comment used to fire a
+  `pg_notify('comment_mentions', …)` that no process in the codebase ever
+  listened for, into a `MSG_MENTION` frame the frontend reserved and never
+  received. Mentioning a colleague did nothing they would ever see. Five events
+  now write to a `notifications` table — mentions, replies in threads you are
+  part of, task assignment, overdue tasks, and documents shared with you — read
+  through an Inbox in the sidebar with an unread badge and a `/notifications`
+  page. Delivery is a 30-second poll that also refreshes on window focus; the
+  table is shaped as an outbox (`emailed_at`) so email can arrive later without
+  a migration. Idempotency is a unique index on `(user_id, dedupe_key)` rather
+  than application logic, which is what lets the overdue sweep run on every
+  replica with no leader election.
+- **Two checklist items with identical text assigned to the same person notify
+  once.** The notification's dedupe key is content-addressed precisely so that
+  reordering a checklist does not re-notify everyone; the cost is that identical
+  text collides. The assignee still sees both items on `/tasks`.
+- **Self-assignment is not suppressed when you assign yourself by typing.** The
+  guard that drops self-notifications needs to know who acted, but the path a
+  live edit takes does not carry that: WebSocket updates are persisted with no
+  user id, and the channel feeding the reindex worker carries only a document
+  id. Editing a checklist item that assigns you a task will notify you about it;
+  the guard does work on the import paths.
+
+### Fixed
+- **Members whose display name contains a space could not be mentioned when
+  opening a thread or replying.** Comment mentions were resolved server-side
+  by matching `@(\w+)` against member display names, so `@Christian Hüning`
+  captured `Christian`, matched nobody, and silently notified no one. The
+  mention picker now sends the user ids it resolved, unioned with whatever the
+  regex still matches so a hand-typed second name is never dropped; the regex
+  remains as the sole path for comments written before this release. Editing
+  an existing comment does not yet carry a `mentions` field, so adding
+  `@Christian Hüning` in an edit still notifies nobody — only the create path
+  is fixed here.
+
 ## [0.5.0] - 2026-09-06
 
 The editor moves from Tiptap 2 to Tiptap 3. The visible result should be nothing

@@ -59,6 +59,11 @@ pub enum RefreshError {
 /// reflected on `/tasks` (markdown export, full-doc import via
 /// ApplyUpdate/ReplaceWithMarkdown, individual task patch).
 ///
+/// `actor_id` is whoever's edit triggered this refresh, forwarded to the
+/// task indexer so a fresh `task_assigned` notification can name an actor
+/// and self-assignment can be suppressed. Pass `None` when the caller has
+/// no edit to attribute (e.g. a plain export) or genuinely doesn't know.
+///
 /// Best-effort: cache-put + indexer failures are logged but never
 /// propagated. The Result reports only the steps before the cache write
 /// (state export + markdown serialise), because failures there mean
@@ -66,21 +71,23 @@ pub enum RefreshError {
 pub async fn refresh_markdown_and_index(
     state: &AppState,
     doc_id: Uuid,
+    actor_id: Option<Uuid>,
 ) -> Result<String, RefreshError> {
-    refresh_markdown_inner(state, doc_id, true).await
+    refresh_markdown_inner(state, doc_id, true, actor_id).await
 }
 
 /// Export the doc to markdown WITHOUT re-running the task indexer.
 /// Used by the from-template flow so cloning a template doesn't
 /// trigger a write to the template's own task rows.
 pub async fn export_markdown_only(state: &AppState, doc_id: Uuid) -> Result<String, RefreshError> {
-    refresh_markdown_inner(state, doc_id, false).await
+    refresh_markdown_inner(state, doc_id, false, None).await
 }
 
 async fn refresh_markdown_inner(
     state: &AppState,
     doc_id: Uuid,
     reindex_tasks: bool,
+    actor_id: Option<Uuid>,
 ) -> Result<String, RefreshError> {
     let rooms = state.rooms_v2.clone().ok_or(RefreshError::NoRooms)?;
     let room = rooms
@@ -130,7 +137,7 @@ async fn refresh_markdown_inner(
         match docs.get(doc_id).await {
             Ok(Some(doc)) => {
                 if let Err(e) = tasks
-                    .upsert_for_doc(doc.workspace_id, doc_id, &inputs)
+                    .upsert_for_doc(doc.workspace_id, doc_id, &inputs, actor_id)
                     .await
                 {
                     tracing::warn!(error=?e, "task reindex failed");
@@ -153,7 +160,9 @@ pub(super) async fn export_inline(
     if req.extensions().get::<EffectiveDocRole>().is_none() {
         return json_err(StatusCode::FORBIDDEN, "acl.no_grant", "");
     }
-    let text = match refresh_markdown_and_index(&state, doc_id).await {
+    // A plain export doesn't edit the doc, so there's no actor to
+    // attribute a `task_assigned` notification to.
+    let text = match refresh_markdown_and_index(&state, doc_id, None).await {
         Ok(t) => t,
         Err(e) => {
             tracing::error!(error=?e, %doc_id, "md export refresh");
@@ -276,7 +285,7 @@ pub(super) async fn import_inline(
 
     match applied {
         Ok(_seq) => {
-            let _ = refresh_markdown_and_index(&state, doc_id).await;
+            let _ = refresh_markdown_and_index(&state, doc_id, Some(ctx.user_id)).await;
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => {

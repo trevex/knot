@@ -35,17 +35,29 @@ export const commentsApi = {
     positionY: string | null,
     positionYEnd: string | null,
     anchorText: string | null,
+    mentions: string[] = [],
   ): Promise<ApiResult<Comment>> {
     return apiFetch<Comment>(`/api/docs/${encodeURIComponent(docId)}/comments`, {
       method: "POST",
-      body: { body, position_y: positionY, position_y_end: positionYEnd, anchor_text: anchorText },
+      body: {
+        body,
+        position_y: positionY,
+        position_y_end: positionYEnd,
+        anchor_text: anchorText,
+        mentions,
+      },
     });
   },
 
-  async reply(docId: string, threadId: string, body: string): Promise<ApiResult<Comment>> {
+  async reply(
+    docId: string,
+    threadId: string,
+    body: string,
+    mentions: string[] = [],
+  ): Promise<ApiResult<Comment>> {
     return apiFetch<Comment>(
       `/api/docs/${encodeURIComponent(docId)}/comments/${encodeURIComponent(threadId)}/replies`,
-      { method: "POST", body: { body } },
+      { method: "POST", body: { body, mentions } },
     );
   },
 

@@ -48,6 +48,12 @@ pub fn init(addr: &str) -> Result<(), MetricsError> {
     );
     describe_counter!("knot_room_snapshots_total", "Snapshots written to storage");
 
+    // Notifications
+    describe_counter!(
+        "knot_notifications_emitted_total",
+        "Notifications written to the inbox, by kind"
+    );
+
     // Storage / pool
     describe_gauge!("knot_db_pool_size", "Total connections in the pool");
     describe_gauge!("knot_db_pool_idle", "Idle connections in the pool");

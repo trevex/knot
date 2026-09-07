@@ -50,11 +50,23 @@ pub trait TaskStore: Send + Sync + 'static {
     /// Replace the task set for `doc_id` with `items`. Rows that fell out
     /// of the new set are deleted. `completed_at` is preserved across
     /// re-indexing when the checked status doesn't change.
+    ///
+    /// `actor_id` is whoever's edit triggered the reindex, when known; it
+    /// becomes the actor on any `task_assigned` notification, and
+    /// suppresses the notification when someone assigns a task to
+    /// themselves. It is `None` on the live-editing path — the CRDT room
+    /// persists updates without an editor identity, and the reindex worker
+    /// that drains its dirty-doc channel receives only a doc id — so
+    /// self-assignment is **not** suppressed there: a task assigned to
+    /// yourself while co-editing still produces a `task_assigned` row with
+    /// a NULL actor. The guard only has an effect on paths that pass a real
+    /// actor, currently the markdown/workspace import handlers.
     async fn upsert_for_doc(
         &self,
         workspace_id: Uuid,
         doc_id: Uuid,
         items: &[DocTaskInput],
+        actor_id: Option<Uuid>,
     ) -> Result<()>;
 
     /// All open (uncompleted) tasks for a user across the workspace.
@@ -90,6 +102,7 @@ impl TaskStore for PgTaskStore {
         workspace_id: Uuid,
         doc_id: Uuid,
         items: &[DocTaskInput],
+        actor_id: Option<Uuid>,
     ) -> Result<()> {
         let mut tx = crate::begin(&self.pool).await?;
 
@@ -143,6 +156,53 @@ impl TaskStore for PgTaskStore {
             .bind(item.due_at)
             .execute(&mut *tx)
             .await?;
+
+            // Notify a new assignee — but key on the task's *content*, not
+            // its id. Ids are "<doc_id>:<item_index>" and every reorder
+            // rewrites them, so an id-keyed notification would re-fire for
+            // every assignee each time anyone moved a list item.
+            //
+            // `!item.checked` matters beyond "don't notify about a task
+            // someone already finished": it is also what keeps an existing
+            // deployment's first reindex after this feature ships from
+            // notifying every assignee about their entire historical
+            // backlog of *completed* work. The still-open backlog is
+            // handled separately, by the seed migration that pre-populates
+            // dedupe rows for currently-unchecked assigned tasks (see
+            // migrations/20260907120000_notifications_kind_check_and_task_assigned_seed.sql).
+            if let Some(assignee) = item.assignee_user_id
+                && Some(assignee) != actor_id
+                && !item.checked
+            {
+                let dedupe_key = task_assigned_dedupe_key(doc_id, &item.text, assignee);
+                let res = sqlx::query(
+                    "INSERT INTO notifications \
+                       (workspace_id, user_id, actor_id, kind, doc_id, target_kind, target_id, dedupe_key, data) \
+                     VALUES ($1, $2, $3, 'task_assigned', $4, 'task', $5, $6, $7) \
+                     ON CONFLICT (user_id, dedupe_key) DO NOTHING",
+                )
+                .bind(workspace_id)
+                .bind(assignee)
+                .bind(actor_id)
+                .bind(doc_id)
+                .bind(&id)
+                .bind(&dedupe_key)
+                .bind(serde_json::json!({ "excerpt": item.text }))
+                .execute(&mut *tx)
+                .await?;
+
+                // This insert bypasses `NotificationStore::emit`, which is
+                // the only other place this counter is incremented — so
+                // without this, `task_assigned` never shows up in
+                // `knot_notifications_emitted_total` at all. Count only
+                // rows actually inserted, matching `emit`'s
+                // `rows_affected() == 1` check, so a deduped no-op doesn't
+                // inflate the counter.
+                if res.rows_affected() == 1 {
+                    metrics::counter!("knot_notifications_emitted_total", "kind" => "task_assigned")
+                        .increment(1);
+                }
+            }
         }
 
         tx.commit().await?;
@@ -191,6 +251,32 @@ impl TaskStore for PgTaskStore {
         .await?;
         Ok(rows)
     }
+}
+
+/// First 8 bytes of a digest as lowercase hex — 16 characters, enough to
+/// key a notification without carrying the whole hash in every row.
+fn hex_prefix(digest: &[u8]) -> String {
+    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The content-addressed `dedupe_key` for a `task_assigned` notification:
+/// `task_assigned:<doc_id>:<first 8 bytes of sha256(text) as lowercase
+/// hex>:<assignee>`. Reordering a checklist changes `doc_tasks.id` but not
+/// this key; editing the text does.
+///
+/// `pub` (and re-exported from the crate root) purely so
+/// `crates/knot-storage/tests/notifications.rs` can assert this agrees,
+/// byte for byte, with the SQL expression the seed migration
+/// (`migrations/20260907120000_notifications_kind_check_and_task_assigned_seed.sql`)
+/// uses to pre-populate the same keys: `encode(substring(sha256(convert_to(text,
+/// 'UTF8')) from 1 for 8), 'hex')`. If the two ever disagree the seed
+/// migration is silently useless — it inserts rows under keys the runtime
+/// will never look up again.
+pub fn task_assigned_dedupe_key(doc_id: Uuid, text: &str, assignee: Uuid) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(text.as_bytes());
+    let short = hex_prefix(&digest);
+    format!("task_assigned:{doc_id}:{short}:{assignee}")
 }
 
 impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for DocTask {

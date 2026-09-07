@@ -6,7 +6,7 @@ interface Props {
   placeholder?: string;
   submitLabel?: string;
   isPending?: boolean;
-  onSubmit: (body: string) => void;
+  onSubmit: (body: string, mentions: string[]) => void;
   "data-testid-input"?: string;
   "data-testid-submit"?: string;
 }
@@ -20,14 +20,29 @@ export function CommentComposer({
   "data-testid-submit": testidSubmit,
 }: Props) {
   const [body, setBody] = useState("");
-  const { textareaProps, picker } = useMentionPicker(body, setBody);
+  const [mentions, setMentions] = useState<string[]>([]);
+  // id -> display name at the moment it was picked, so submit-time can
+  // tell whether the name is still actually in the body (Finding 8: pick
+  // @Carol, backspace her name back out, submit — without this check
+  // Carol still gets notified for a comment that no longer names her).
+  const [mentionNames, setMentionNames] = useState<Record<string, string>>({});
+  const { textareaProps, picker } = useMentionPicker(body, setBody, (id, displayName) => {
+    setMentions((prev) => (prev.includes(id) ? prev : [...prev, id]));
+    setMentionNames((prev) => ({ ...prev, [id]: displayName }));
+  });
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     const trimmed = body.trim();
     if (!trimmed) return;
-    onSubmit(trimmed);
+    const stillNamed = mentions.filter((id) => {
+      const name = mentionNames[id];
+      return name !== undefined && trimmed.includes(name);
+    });
+    onSubmit(trimmed, stillNamed);
     setBody("");
+    setMentions([]);
+    setMentionNames({});
   }
 
   return (

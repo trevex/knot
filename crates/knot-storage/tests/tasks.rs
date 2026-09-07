@@ -44,7 +44,10 @@ async fn upsert_then_list_returns_rows() {
             due_at: None,
         },
     ];
-    store.upsert_for_doc(ws_id, doc_id, &items).await.unwrap();
+    store
+        .upsert_for_doc(ws_id, doc_id, &items, None)
+        .await
+        .unwrap();
     let in_doc = store.list_for_doc(doc_id).await.unwrap();
     assert_eq!(in_doc.len(), 2);
     let mine = store.list_for_assignee(ws_id, user_id, true).await.unwrap();
@@ -70,7 +73,10 @@ async fn list_excludes_completed_by_default() {
             due_at: None,
         },
     ];
-    store.upsert_for_doc(ws_id, doc_id, &items).await.unwrap();
+    store
+        .upsert_for_doc(ws_id, doc_id, &items, None)
+        .await
+        .unwrap();
     let open_only = store
         .list_for_assignee(ws_id, user_id, false)
         .await
@@ -106,7 +112,10 @@ async fn upsert_replaces_set_dropping_removed_items() {
             due_at: None,
         },
     ];
-    store.upsert_for_doc(ws_id, doc_id, &v1).await.unwrap();
+    store
+        .upsert_for_doc(ws_id, doc_id, &v1, None)
+        .await
+        .unwrap();
     assert_eq!(store.list_for_doc(doc_id).await.unwrap().len(), 3);
     // Second pass: only index 0 and 2 remain. Index 1 must be deleted.
     let v2 = vec![
@@ -125,7 +134,10 @@ async fn upsert_replaces_set_dropping_removed_items() {
             due_at: None,
         },
     ];
-    store.upsert_for_doc(ws_id, doc_id, &v2).await.unwrap();
+    store
+        .upsert_for_doc(ws_id, doc_id, &v2, None)
+        .await
+        .unwrap();
     let after = store.list_for_doc(doc_id).await.unwrap();
     assert_eq!(after.len(), 2);
     assert!(after.iter().any(|t| t.item_index == 0));
@@ -146,9 +158,15 @@ async fn empty_upsert_clears_all_doc_tasks() {
         checked: false,
         due_at: None,
     }];
-    store.upsert_for_doc(ws_id, doc_id, &v1).await.unwrap();
+    store
+        .upsert_for_doc(ws_id, doc_id, &v1, None)
+        .await
+        .unwrap();
     assert_eq!(store.list_for_doc(doc_id).await.unwrap().len(), 1);
-    store.upsert_for_doc(ws_id, doc_id, &[]).await.unwrap();
+    store
+        .upsert_for_doc(ws_id, doc_id, &[], None)
+        .await
+        .unwrap();
     assert_eq!(store.list_for_doc(doc_id).await.unwrap().len(), 0);
 }
 
@@ -167,6 +185,7 @@ async fn checked_transition_stamps_completed_at_and_clears_on_uncheck() {
                 checked: false,
                 due_at: None,
             }],
+            None,
         )
         .await
         .unwrap();
@@ -187,6 +206,7 @@ async fn checked_transition_stamps_completed_at_and_clears_on_uncheck() {
                 checked: true,
                 due_at: None,
             }],
+            None,
         )
         .await
         .unwrap();
@@ -207,6 +227,7 @@ async fn checked_transition_stamps_completed_at_and_clears_on_uncheck() {
                 checked: false,
                 due_at: None,
             }],
+            None,
         )
         .await
         .unwrap();
@@ -232,6 +253,7 @@ async fn unchanged_checked_preserves_completed_at_across_reindex() {
                 checked: true,
                 due_at: None,
             }],
+            None,
         )
         .await
         .unwrap();
@@ -250,6 +272,7 @@ async fn unchanged_checked_preserves_completed_at_across_reindex() {
                 checked: true,
                 due_at: None,
             }],
+            None,
         )
         .await
         .unwrap();

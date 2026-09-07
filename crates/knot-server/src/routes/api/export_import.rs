@@ -686,7 +686,9 @@ async fn import(
         if matches!(rx.await, Ok(Ok(_))) {
             // Best-effort: kick the indexer so /tasks reflects the imported
             // tree without waiting for someone to hit each markdown export.
-            let _ = super::markdown::refresh_markdown_and_index(&state, new_doc_id).await;
+            let _ =
+                super::markdown::refresh_markdown_and_index(&state, new_doc_id, Some(ctx.user_id))
+                    .await;
         }
     }
 

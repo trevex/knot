@@ -117,7 +117,14 @@ pub(super) async fn put_inline(
         )
         .await
     {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            if let Some(rest) = principal.strip_prefix("user:")
+                && let Ok(grantee) = Uuid::parse_str(rest)
+            {
+                emit_doc_shared(&state, doc_id, grantee, ctx.user_id).await;
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => {
             tracing::error!(error=?e, "grants put");
             internal()
@@ -173,4 +180,30 @@ async fn read_json<T: serde::de::DeserializeOwned>(req: Request) -> Result<T, ()
 
 fn internal() -> Response {
     json_err(StatusCode::INTERNAL_SERVER_ERROR, "internal", "")
+}
+
+/// Tell the grantee a document was shared with them. Best-effort: a failure
+/// here must not fail the grant that already committed.
+async fn emit_doc_shared(state: &AppState, doc_id: Uuid, grantee: Uuid, actor: Uuid) {
+    let (Some(notifications), Some(docs)) = (state.notifications.clone(), state.docs.clone())
+    else {
+        return;
+    };
+    let Ok(Some(doc)) = docs.get(doc_id).await else {
+        return;
+    };
+    let n = knot_storage::NewNotification {
+        workspace_id: doc.workspace_id,
+        user_id: grantee,
+        actor_id: Some(actor),
+        kind: knot_storage::NotificationKind::DocShared,
+        doc_id: Some(doc_id),
+        target_kind: "document".into(),
+        target_id: doc_id.to_string(),
+        dedupe_key: format!("share:{doc_id}:{grantee}"),
+        data: serde_json::json!({ "doc_title": doc.title }),
+    };
+    if let Err(e) = notifications.emit(&n).await {
+        tracing::warn!(error=?e, %doc_id, "emit doc_shared");
+    }
 }
