@@ -382,3 +382,38 @@ async fn editing_a_comment_to_add_a_mention_notifies_exactly_once() {
         "no duplicate mention row when a second edit keeps the same mention"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn granting_access_notifies_the_grantee() {
+    let (state, _ws, doc, _alice, bob) = seeded().await;
+    let cookie = login(&state, "alice@example.com").await;
+
+    let app = router_with_state(state.clone());
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/docs/{doc}/grants/user:{bob}"))
+                .header("cookie", &cookie)
+                .header("x-csrf-token", csrf_from(&cookie))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "role": "editor", "inherit": true }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+    let rows = state
+        .notifications
+        .as_ref()
+        .unwrap()
+        .list(bob, false, 50, None)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].kind, "doc_shared");
+    assert_eq!(rows[0].doc_id, Some(doc));
+}
