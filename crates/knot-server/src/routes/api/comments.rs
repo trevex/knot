@@ -188,28 +188,24 @@ async fn emit_comment_notifications(
         return;
     };
 
-    // Explicit ids from the picker win; the regex is the fallback for
-    // clients that don't send them (and every comment written before this
-    // shipped). Either way, membership decides — an id for a non-member is
-    // dropped rather than trusted.
+    // Explicit ids from the picker UNION the regex's display-name matches
+    // — not either/or. Closing the picker (e.g. typing a trailing space)
+    // and then hand-typing a second `@name` used to be silently dropped
+    // whenever `explicit` was non-empty, because the regex fallback only
+    // ran when it was empty. Either way, membership decides — an id or a
+    // handle for a non-member is dropped rather than trusted.
     let members = match workspaces.list_members(doc.workspace_id).await {
         Ok(m) => m,
         Err(_) => return,
     };
-    let mentioned: Vec<Uuid> = if explicit.is_empty() {
-        let handles = extract_mentions(body);
-        members
-            .iter()
-            .filter(|m| handles.contains(&m.display_name.to_lowercase()))
-            .map(|m| m.user_id)
-            .collect()
-    } else {
-        members
-            .iter()
-            .filter(|m| explicit.contains(&m.user_id))
-            .map(|m| m.user_id)
-            .collect()
-    };
+    let handles = extract_mentions(body);
+    let mentioned: Vec<Uuid> = members
+        .iter()
+        .filter(|m| {
+            explicit.contains(&m.user_id) || handles.contains(&m.display_name.to_lowercase())
+        })
+        .map(|m| m.user_id)
+        .collect();
 
     let excerpt: String = body.chars().take(140).collect();
     let base_data = serde_json::json!({

@@ -18,9 +18,28 @@ pub struct SweepOutcome {
     pub pruned: u64,
 }
 
-/// Emit `task_due` for every open, assigned, overdue task, then prune.
-/// The dedupe key carries the date, so an overdue task notifies once a day
-/// rather than once every fifteen minutes.
+/// Emit `task_due` for every open, assigned, task that went overdue in the
+/// last 7 days, then prune.
+///
+/// The dedupe key is content-addressed exactly like `task_assigned`'s
+/// (`task_due:<doc_id>:<sha256(text)[..16]>:<assignee>:<date>`, computed with
+/// the same SQL sha256 expression `PgTaskStore` uses at
+/// `crates/knot-storage/src/tasks.rs`) rather than keyed on `doc_tasks.id`.
+/// `doc_tasks.id` is `"<doc_id>:<item_index>"`, so inserting a checklist
+/// item above an overdue one shifts every later item's id — an id-keyed
+/// dedupe key would treat that reorder as a brand-new task and re-notify
+/// every overdue assignee the same day. The date suffix still makes the key
+/// a pure function of `(task content, assignee, day)`, so an overdue task
+/// notifies once a day rather than once every fifteen minutes.
+///
+/// The `t.due_at > $1 - interval '7 days'` floor exists so that on an
+/// existing deployment — where `doc_tasks` already has rows with `due_at`
+/// stretching back to whenever the workspace was created, and
+/// `notifications` starts out empty — the first sweep after this feature
+/// ships does not treat every task that has *ever* been overdue as newly
+/// overdue and fire a `task_due` burst for the entire historical backlog.
+/// Only work that went overdue recently is worth a push; anything older
+/// than that is still visible on `/tasks` without a notification.
 pub async fn run_once(pool: &PgPool, now: DateTime<Utc>) -> Result<SweepOutcome, sqlx::Error> {
     // The date half of the dedupe key is computed here, in Rust, from `now`
     // — not with `to_char(...)` in SQL. `to_char` renders using the
@@ -35,13 +54,16 @@ pub async fn run_once(pool: &PgPool, now: DateTime<Utc>) -> Result<SweepOutcome,
         "INSERT INTO notifications \
            (workspace_id, user_id, actor_id, kind, doc_id, target_kind, target_id, dedupe_key, data) \
          SELECT t.workspace_id, t.assignee_user_id, NULL, 'task_due', t.doc_id, 'task', t.id, \
-                'task_due:' || t.id || ':' || $2, \
-                jsonb_build_object('text', t.text, 'due_at', t.due_at) \
+                'task_due:' || t.doc_id || ':' || \
+                  encode(substring(sha256(convert_to(t.text, 'UTF8')) from 1 for 8), 'hex') || \
+                  ':' || t.assignee_user_id || ':' || $2, \
+                jsonb_build_object('excerpt', t.text, 'due_at', t.due_at) \
          FROM doc_tasks t \
          WHERE t.assignee_user_id IS NOT NULL \
            AND t.checked = false \
            AND t.due_at IS NOT NULL \
            AND t.due_at < $1 \
+           AND t.due_at > $1 - interval '7 days' \
          ON CONFLICT (user_id, dedupe_key) DO NOTHING",
     )
     .bind(now)

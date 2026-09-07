@@ -88,6 +88,101 @@ async fn overdue_task_emits_once_per_day_even_across_concurrent_sweeps() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn task_due_survives_a_reorder_without_re_notifying() {
+    // Finding 5: `doc_tasks.id` is "<doc_id>:<item_index>". Keying
+    // `task_due` on it meant inserting an item above an already-overdue
+    // one shifted the id of everything below, so the dedupe index saw what
+    // looked like a brand-new overdue task and fired a second `task_due`
+    // the same day — the exact reorder hazard the design's §2 warns about
+    // for `task_assigned`. The content-addressed key must survive this.
+    let pool = knot_test_support::fresh_db().await.pool;
+    let ws = PgWorkspaceStore::new(pool.clone())
+        .create("default", "W")
+        .await
+        .unwrap();
+    let alice = PgUserStore::new(pool.clone())
+        .create_local("alice@x.test", "Alice", "$h$")
+        .await
+        .unwrap();
+    let bob = PgUserStore::new(pool.clone())
+        .create_local("bob@x.test", "Bob", "$h$")
+        .await
+        .unwrap();
+    let ws_store = PgWorkspaceStore::new(pool.clone());
+    ws_store
+        .add_member(ws.id, alice.id, WorkspaceRole::Owner)
+        .await
+        .unwrap();
+    ws_store
+        .add_member(ws.id, bob.id, WorkspaceRole::Editor)
+        .await
+        .unwrap();
+    let doc = PgDocStore::new(pool.clone())
+        .create(ws.id, None, "Doc", &sort_key_between(None, None), alice.id)
+        .await
+        .unwrap();
+
+    let tasks = PgTaskStore::new(pool.clone());
+    let overdue = DocTaskInput {
+        item_index: 0,
+        text: "ship it".into(),
+        assignee_user_id: Some(bob.id),
+        checked: false,
+        due_at: Some(Utc::now() - Duration::days(1)),
+    };
+    tasks
+        .upsert_for_doc(
+            ws.id,
+            doc.id,
+            std::slice::from_ref(&overdue),
+            Some(alice.id),
+        )
+        .await
+        .unwrap();
+
+    let now = Utc::now();
+    let first = notifications_sweep::run_once(&pool, now).await.unwrap();
+    assert_eq!(first.due_emitted, 1, "the overdue task notifies once");
+
+    // Insert an unrelated item above it: "ship it" moves from doc_tasks id
+    // "<doc>:0" to "<doc>:1" even though nothing about the task itself —
+    // text, assignee, due date — changed.
+    let inserted_above = DocTaskInput {
+        item_index: 0,
+        text: "an unrelated new item".into(),
+        assignee_user_id: None,
+        checked: false,
+        due_at: None,
+    };
+    let shifted = DocTaskInput {
+        item_index: 1,
+        ..overdue.clone()
+    };
+    tasks
+        .upsert_for_doc(ws.id, doc.id, &[inserted_above, shifted], Some(alice.id))
+        .await
+        .unwrap();
+
+    let second = notifications_sweep::run_once(&pool, now).await.unwrap();
+    assert_eq!(
+        second.due_emitted, 0,
+        "a reorder that only changes doc_tasks.id must not look like a new overdue task"
+    );
+
+    let due_rows = PgNotificationStore::new(pool)
+        .list(bob.id, false, 50, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.kind == "task_due")
+        .count();
+    assert_eq!(
+        due_rows, 1,
+        "bob must have exactly one task_due row across both sweeps"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_checked_task_is_never_overdue() {
     let pool = knot_test_support::fresh_db().await.pool;
     let ws = PgWorkspaceStore::new(pool.clone())

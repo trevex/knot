@@ -33,12 +33,16 @@ so this log can be regenerated from history (e.g. with `git-cliff`).
   the guard does work on the import paths.
 
 ### Fixed
-- **Members whose display name contains a space could not be mentioned.**
-  Comment mentions were resolved server-side by matching `@(\w+)` against
-  member display names, so `@Christian Hüning` captured `Christian`, matched
-  nobody, and silently notified no one. The mention picker now sends the user
-  ids it resolved; the regex remains as a fallback for comments written before
-  this release.
+- **Members whose display name contains a space could not be mentioned when
+  opening a thread or replying.** Comment mentions were resolved server-side
+  by matching `@(\w+)` against member display names, so `@Christian Hüning`
+  captured `Christian`, matched nobody, and silently notified no one. The
+  mention picker now sends the user ids it resolved, unioned with whatever the
+  regex still matches so a hand-typed second name is never dropped; the regex
+  remains as the sole path for comments written before this release. Editing
+  an existing comment does not yet carry a `mentions` field, so adding
+  `@Christian Hüning` in an edit still notifies nobody — only the create path
+  is fixed here.
 
 ## [0.5.0] - 2026-09-06
 

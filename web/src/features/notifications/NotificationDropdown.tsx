@@ -9,7 +9,7 @@
 import { useNavigate } from "react-router-dom";
 
 import type { Notification } from "../../lib/notifications.api";
-import { KIND_LABEL, targetPath } from "./notificationTarget";
+import { notificationText, targetPath } from "./notificationTarget";
 import { useMarkRead, useNotificationList } from "./useNotifications";
 
 export function NotificationDropdown({ onClose }: { onClose: () => void }) {
@@ -36,26 +36,30 @@ export function NotificationDropdown({ onClose }: { onClose: () => void }) {
         <p className="px-3 py-3 text-[12px] text-fg-muted m-0">Nothing here yet.</p>
       )}
       <ul className="m-0 p-0 list-none max-h-[320px] overflow-y-auto">
-        {items.map((n) => (
-          <li key={n.id}>
-            <button
-              type="button"
-              role="menuitem"
-              data-testid="notification-row"
-              data-kind={n.kind}
-              data-read={n.read ? "true" : "false"}
-              onClick={() => open(n)}
-              className="w-full text-left px-3 py-2 text-[12px] text-fg hover:bg-muted transition-colors ease-swift duration-150"
-            >
-              {!n.read && (
-                <span aria-hidden className="inline-block h-2 w-2 rounded-full bg-accent mr-2" />
-              )}
-              <strong className="font-semibold">{n.actor_display_name ?? "knot"}</strong>{" "}
-              {KIND_LABEL[n.kind]}
-              {n.doc_title ? <span className="text-fg-muted"> · {n.doc_title}</span> : null}
-            </button>
-          </li>
-        ))}
+        {items.map((n) => {
+          const { actor, label } = notificationText(n);
+          return (
+            <li key={n.id}>
+              <button
+                type="button"
+                role="menuitem"
+                data-testid="notification-row"
+                data-kind={n.kind}
+                data-read={n.read ? "true" : "false"}
+                onClick={() => open(n)}
+                className="w-full text-left px-3 py-2 text-[12px] text-fg hover:bg-muted transition-colors ease-swift duration-150"
+              >
+                {!n.read && (
+                  <span aria-hidden className="inline-block h-2 w-2 rounded-full bg-accent mr-2" />
+                )}
+                {actor && <strong className="font-semibold">{actor}</strong>}
+                {actor ? " " : ""}
+                {label}
+                {n.doc_title ? <span className="text-fg-muted"> · {n.doc_title}</span> : null}
+              </button>
+            </li>
+          );
+        })}
       </ul>
       <button
         type="button"

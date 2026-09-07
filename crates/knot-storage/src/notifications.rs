@@ -232,10 +232,25 @@ impl NotificationStore for PgNotificationStore {
     }
 
     async fn prune(&self, now: DateTime<Utc>) -> Result<u64> {
+        // `task_assigned` is excluded: unlike the other four kinds, its
+        // persisted row is not just an inbox entry, it is the *only* thing
+        // suppressing a re-notification. `PgTaskStore::upsert_for_doc`
+        // re-derives `task_assigned` from `doc_tasks` on every reindex and
+        // relies on `notifications_dedupe` to no-op when it already
+        // notified about an assignment. Pruning a read `task_assigned` row
+        // after 90 days would let the next edit of that document — however
+        // unrelated to this task — re-notify the assignee about an
+        // unchanged, months-old assignment. The other four kinds derive
+        // from a one-time write event and never re-emit, so ordinary
+        // retention is safe for them. These rows are tiny, so keeping them
+        // indefinitely costs nothing worth reclaiming.
         let res = sqlx::query(
             "DELETE FROM notifications \
-             WHERE (read_at IS NOT NULL AND created_at < $1 - interval '90 days') \
-                OR created_at < $1 - interval '180 days'",
+             WHERE kind <> 'task_assigned' \
+               AND ( \
+                 (read_at IS NOT NULL AND created_at < $1 - interval '90 days') \
+                 OR created_at < $1 - interval '180 days' \
+               )",
         )
         .bind(now)
         .execute(&self.pool)

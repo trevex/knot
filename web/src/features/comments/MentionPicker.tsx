@@ -32,7 +32,7 @@ function parseMention(value: string, cursorPos: number): MentionState | null {
 export function useMentionPicker(
   value: string,
   onChange: (v: string) => void,
-  onPickUser?: (userId: string) => void,
+  onPickUser?: (userId: string, displayName: string) => void,
 ) {
   const [cursor, setCursor] = useState(0);
   const [highlightIndex, setHighlightIndex] = useState(0);
@@ -58,7 +58,7 @@ export function useMentionPicker(
     const before = value.slice(0, mention.atOffset);
     const after = value.slice(cursor);
     onChange(before + `@${member.display_name} ` + after);
-    onPickUser?.(member.user_id);
+    onPickUser?.(member.user_id, member.display_name);
     setHighlightIndex(0);
   }
 

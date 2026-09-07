@@ -4,7 +4,7 @@
 use knot_storage::{
     DocStore, DocTaskInput, NewNotification, NotificationKind, NotificationStore, PgDocStore,
     PgNotificationStore, PgTaskStore, PgUserStore, PgWorkspaceStore, TaskStore, UserStore,
-    WorkspaceRole, WorkspaceStore, sort_key_between,
+    WorkspaceRole, WorkspaceStore, sort_key_between, task_assigned_dedupe_key,
 };
 use uuid::Uuid;
 
@@ -220,6 +220,56 @@ async fn prune_drops_read_rows_past_ninety_days_and_everything_past_one_eighty()
     let left = store.list(bob, false, 50, None).await.unwrap();
     assert_eq!(left.len(), 1);
     assert_eq!(left[0].id, rows[1].id);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn prune_never_touches_task_assigned_even_when_read_and_old() {
+    // task_assigned is the one kind whose persisted row is the *only*
+    // thing suppressing a re-notification: PgTaskStore::upsert_for_doc
+    // re-derives it from doc_tasks on every reindex and relies on the
+    // dedupe row already existing. If retention pruned it like every other
+    // kind, the next edit of a document — any edit, unrelated to the task
+    // — would re-notify the assignee about a months-old, unchanged
+    // assignment. A same-age `mention` row is the control: it must still
+    // go, proving this isn't just a floor that swallowed everything.
+    let (store, ws, doc, alice, bob) = setup().await;
+    store
+        .emit(&mention_for(ws, doc, bob, alice, Uuid::new_v4()))
+        .await
+        .unwrap();
+    store
+        .emit(&NewNotification {
+            workspace_id: ws,
+            user_id: bob,
+            actor_id: None,
+            kind: NotificationKind::TaskAssigned,
+            doc_id: Some(doc),
+            target_kind: "task".into(),
+            target_id: format!("{doc}:0"),
+            dedupe_key: format!("task_assigned:{doc}:deadbeefcafebabe:{bob}"),
+            data: serde_json::json!({ "excerpt": "old task" }),
+        })
+        .await
+        .unwrap();
+
+    let rows = store.list(bob, false, 50, None).await.unwrap();
+    let task_assigned = rows.iter().find(|r| r.kind == "task_assigned").unwrap().id;
+    let mention = rows.iter().find(|r| r.kind == "mention").unwrap().id;
+    // Both read, both well past the 90-day read-row threshold.
+    backdate(&store, task_assigned, 200, true).await;
+    backdate(&store, mention, 200, true).await;
+
+    assert_eq!(
+        store.prune(chrono::Utc::now()).await.unwrap(),
+        1,
+        "only the mention row should be deleted"
+    );
+    let left = store.list(bob, false, 50, None).await.unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(
+        left[0].id, task_assigned,
+        "the read, 200-day-old task_assigned row must survive prune"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -485,4 +535,95 @@ async fn assigning_a_task_to_yourself_notifies_nobody() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn assigning_an_already_checked_task_notifies_nobody() {
+    // Finding 1a: without a `checked` guard, a checklist item that was
+    // completed months ago — and is only unchecked in the sense that it
+    // was never notified about before this feature existed — would still
+    // fire a `task_assigned` row the first time its document gets
+    // reindexed. Landing a task as checked from the start (import, or any
+    // path that never went through the unchecked state) must notify
+    // nobody, matching a task that's simply done.
+    let pool = knot_test_support::fresh_db().await.pool;
+    let ws = PgWorkspaceStore::new(pool.clone())
+        .create("default", "W")
+        .await
+        .unwrap();
+    let alice = PgUserStore::new(pool.clone())
+        .create_local("alice@x.test", "Alice", "$h$")
+        .await
+        .unwrap();
+    let bob = PgUserStore::new(pool.clone())
+        .create_local("bob@x.test", "Bob", "$h$")
+        .await
+        .unwrap();
+    PgWorkspaceStore::new(pool.clone())
+        .add_member(ws.id, alice.id, WorkspaceRole::Owner)
+        .await
+        .unwrap();
+    PgWorkspaceStore::new(pool.clone())
+        .add_member(ws.id, bob.id, WorkspaceRole::Editor)
+        .await
+        .unwrap();
+    let doc = PgDocStore::new(pool.clone())
+        .create(ws.id, None, "Doc", &sort_key_between(None, None), alice.id)
+        .await
+        .unwrap();
+
+    PgTaskStore::new(pool.clone())
+        .upsert_for_doc(
+            ws.id,
+            doc.id,
+            &[DocTaskInput {
+                item_index: 0,
+                text: "already done on arrival".into(),
+                assignee_user_id: Some(bob.id),
+                checked: true,
+                due_at: None,
+            }],
+            Some(alice.id),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        PgNotificationStore::new(pool)
+            .list(bob.id, false, 50, None)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a task that lands checked must not notify its assignee"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sql_and_rust_task_assigned_dedupe_keys_agree() {
+    // Finding 1c's seed migration
+    // (migrations/20260907120000_notifications_kind_check_and_task_assigned_seed.sql)
+    // reproduces `task_assigned_dedupe_key` in raw SQL — `encode(substring(
+    // sha256(convert_to(text, 'UTF8')) from 1 for 8), 'hex')` — so it can
+    // pre-populate dedupe rows for tasks that already existed when this
+    // feature ships. If the SQL and Rust ever disagree, the seed inserts
+    // rows under keys the runtime will never look up again, and the whole
+    // point of the migration (a silent upgrade) silently fails instead.
+    // The non-ASCII and empty-string cases matter because sha256 operates
+    // on UTF-8 bytes, not chars, and an empty task text is a valid input.
+    let (store, _ws, doc, _alice, bob) = setup().await;
+    for text in ["follow up", "Jörg follow up 日本語 🎉", ""] {
+        let rust_key = task_assigned_dedupe_key(doc, text, bob);
+        let (sql_key,): (String,) = sqlx::query_as(
+            "SELECT 'task_assigned:' || $1::uuid || ':' || \
+                encode(substring(sha256(convert_to($2, 'UTF8')) from 1 for 8), 'hex') || \
+                ':' || $3::uuid",
+        )
+        .bind(doc)
+        .bind(text)
+        .bind(bob)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(rust_key, sql_key, "mismatch for text = {text:?}");
+    }
 }

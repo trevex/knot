@@ -40,7 +40,9 @@ pub use share_tokens::{PgShareTokenStore, ShareStoreError, ShareToken, ShareToke
 pub use snapshot_store::{
     DocSnapshot, PgSnapshotStore, SnapshotMeta, SnapshotStore, SnapshotStoreError,
 };
-pub use tasks::{DocTask, DocTaskInput, PgTaskStore, TaskStore, TaskStoreError};
+pub use tasks::{
+    DocTask, DocTaskInput, PgTaskStore, TaskStore, TaskStoreError, task_assigned_dedupe_key,
+};
 pub use updates_store::{DocUpdate, PgUpdatesStore, UpdatesStore, UpdatesStoreError};
 pub use user_store::{PgUserStore, User, UserStore, UserStoreError};
 pub use workspace_store::{

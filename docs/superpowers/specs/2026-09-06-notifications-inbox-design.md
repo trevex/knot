@@ -49,8 +49,15 @@ completed.
 
 ### 1. Schema
 
-One additive migration. No backfill: mentions that happened before this ships
-stay unnotified.
+One additive migration, plus a second one landing in the same review pass
+(`migrations/20260907120000_notifications_kind_check_and_task_assigned_seed.sql`)
+that constrains `kind` and pre-seeds `task_assigned` dedupe rows — see the note
+at the end of §2. No backfill of *visible* notifications: mentions, replies,
+and shares that happened before this ships stay unnotified. `task_assigned` is
+the one exception, and only in the dedupe sense: the seed migration inserts
+already-`read_at` rows for tasks assigned before this shipped, purely so the
+first reindex of an old document doesn't mistake pre-existing assignments for
+new ones (see §2).
 
 ```sql
 CREATE TABLE notifications (
@@ -76,7 +83,14 @@ CREATE INDEX notifications_unread ON notifications(user_id) WHERE read_at IS NUL
 
 - `user_id` is the **recipient**, `actor_id` whoever caused it (NULL for
   system-generated events, i.e. `task_due`).
-- `kind` ∈ `mention | reply | task_assigned | task_due | doc_shared`.
+- `kind` ∈ `mention | reply | task_assigned | task_due | doc_shared`, enforced
+  by a `CHECK` constraint added in the follow-up migration named above. The
+  original decision here was to skip a `CHECK` on the theory that
+  `PgNotificationStore` was the sole write path and application code was the
+  only thing that needed to agree on the five literals — that stopped being
+  true once `task_assigned` (`knot_storage::tasks`) and `task_due` (the sweep,
+  §4) started inserting into this table directly. With three writers, the
+  constraint is cheap insurance against a typo'd literal in any of them.
 - `target_id` is **TEXT**, not UUID, because `doc_tasks.id` is
   `"<doc_id>:<item_index>"` (`migrations/20260604120000_doc_tasks.sql`).
 - `data` carries the denormalised excerpt, doc title at emit time, and
@@ -118,7 +132,7 @@ Five sources:
 | `reply` | same request path | `reply:<comment_id>` |
 | `doc_shared` | grant create in `routes/api/grants.rs` | `share:<doc_id>:<grantee>` |
 | `task_assigned` | `knot_storage::tasks` reindex upsert | `task_assigned:<doc_id>:<sha256(text)[..16]>:<assignee>` |
-| `task_due` | periodic sweep (§4) | `task_due:<task_id>:<due date>` |
+| `task_due` | periodic sweep (§4) | `task_due:<doc_id>:<sha256(text)[..16]>:<assignee>:<due date>` |
 
 **Reply recipients** are the distinct authors of non-deleted comments in the
 thread, minus the actor, minus anyone already receiving a `mention` row for the
@@ -136,7 +150,26 @@ task is arguably a new task, and the alternative (tracking identity across
 reorders) is a much larger change to a table whose id scheme documents itself as
 intentionally unstable.
 
+`task_due` (§4) faces the identical hazard for the identical reason — it is
+also computed from `doc_tasks` rows keyed by that same unstable id — and uses
+the same content-addressed scheme.
+
 Two consequences of that key are accepted rather than fixed.
+
+**An assignee only sees their historical backlog, not a burst of it, on
+upgrade.** `task_assigned` re-derives from existing state rather than a write
+event, so on a deployment where `notifications` starts empty but `doc_tasks`
+already has assignments, the first reindex of each old document would
+otherwise notify every assignee about their entire back catalogue at once.
+Two guards exist for this: `upsert_for_doc` only ever notifies for an
+*unchecked* item (a task completed before this shipped, or between shipping
+and its next reindex, must not surface as a fresh assignment), and the
+migration landing alongside this one pre-seeds already-`read_at` dedupe rows
+for every currently-unchecked assigned task, computing the exact same
+`dedupe_key` in SQL so the first real reindex after deploy finds the row
+already there and no-ops. `crates/knot-storage/tests/notifications.rs` pins
+both: that a checked task never notifies, and that the SQL and Rust forms of
+the key agree byte-for-byte.
 
 **Identical task text does not notify twice.** Two checklist items reading
 "Follow up", assigned to the same person in the same document, hash to the same
@@ -187,26 +220,62 @@ its raw source. Rendering comment bodies as markdown would work, but it pulls
 steep price for a mention chip.
 
 Instead the client sends what it already knows. `MentionPicker` records the
-`user_id` of each member picked; `POST/PATCH /api/comments` gains an optional
+`user_id` of each member picked; the two comment-creation routes (`POST
+/api/docs/{id}/comments` and its `/replies` sibling) gain an optional
 `mentions: [uuid]` field. The server validates each id is a member of the
-comment's workspace and uses that list as the recipients. The body stays plain
+comment's workspace and takes the **union** of that list with whatever the
+display-name regex still matches in the body — not either/or. Picking one
+person from the picker and then hand-typing a second `@name` (closing the
+picker, e.g. by typing a trailing space, drops back to free text) must
+notify both; an id-only-when-present design silently dropped the typed one
+whenever the picker had contributed at least one id. The body stays plain
 `@Christian Hüning` text and renders exactly as it does today.
 
-When `mentions` is absent — comments written before this ships, and any
-scripted client — the display-name regex remains as the fallback path. Editing a
-comment replaces its mention list, and `dedupe_key` is per comment, so adding
-someone in an edit notifies them once and re-notifies nobody.
+For a comment with no `mentions` field at all — every comment written before
+this ships, and any scripted client — the union degenerates to the
+display-name regex alone, so nothing regresses for that case. `dedupe_key` is
+per comment, so mentioning the same person across multiple edits notifies
+them once and re-notifies nobody.
+
+**Editing does not carry a `mentions` field.** `PATCH /api/comments/{id}`
+only takes `body`; the server always treats an edit's explicit-id set as
+empty, so a mention added while editing is only ever caught by the
+display-name regex — a member whose display name contains a space still
+cannot be mentioned by editing an existing comment into naming them. Wiring
+the picker into the edit form is straightforward but is not part of this
+pass; the create path was the one silently notifying nobody, which was the
+more common case and the one this design set out to fix.
 
 ### 4. Sweep
 
 One `tokio::interval` task, 15 minutes, spawned per replica alongside the
 existing listener tasks in `main.rs`. Two jobs:
 
-1. **Overdue tasks** — `doc_tasks WHERE due_at < now() AND NOT checked AND
-   assignee_user_id IS NOT NULL`, emitting `task_due` with a date-stamped dedupe
-   key so an overdue task notifies once per day, not once per sweep.
+1. **Overdue tasks** — `doc_tasks WHERE due_at < now() AND due_at > now() -
+   interval '7 days' AND NOT checked AND assignee_user_id IS NOT NULL`,
+   emitting `task_due`. The 7-day floor exists for the same upgrade reason as
+   §2's `task_assigned` seed: on an existing deployment, `doc_tasks` already
+   has tasks that went overdue at any point in the workspace's history, while
+   `notifications` starts out empty. Without the floor, the first sweep after
+   this ships would treat the *entire* historical backlog of overdue work as
+   newly overdue and fire a `task_due` burst for all of it; a task that has
+   been sitting overdue for months is still visible on `/tasks` without
+   needing a push. The dedupe key is content-addressed exactly like
+   `task_assigned`'s — `task_due:<doc_id>:<sha256(text)[..16]>:<assignee>:<due
+   date>` — rather than keyed on `t.id`, for the identical reorder reason: an
+   id-keyed key would re-fire whenever a list edit shifted a later item's
+   `item_index`. The date suffix still makes an overdue task notify once per
+   day, not once per sweep.
 2. **Retention** — delete read rows older than 90 days, and any row older than
-   180 days.
+   180 days, **except `task_assigned` rows, which are never pruned by this
+   query.** Every other kind derives from a one-time write event and never
+   re-emits, so ordinary retention is safe. `task_assigned` is the exception:
+   its persisted row is the *only* thing suppressing the reindex-triggered
+   re-notify described in §2, so deleting a read row after 90 days would let
+   a later, unrelated edit of the same document re-notify the assignee about
+   a months-old, unchanged assignment. These rows are small in number and
+   tiny individually, so keeping them indefinitely costs nothing worth
+   reclaiming.
 
 Every replica runs both. The unique index plus `ON CONFLICT DO NOTHING` makes
 concurrent sweeps idempotent, so no leader election, no advisory locks, and no
@@ -291,10 +360,26 @@ beside the existing metrics. The sweep logs its emit and prune counts at debug.
   assertion, and it is the test most likely to catch a future change to the task
   id scheme.
 - Editing a task's text does emit — the documented other half of that trade.
+- A task that lands **checked** (never notified while open — e.g. imported
+  already done) does not emit `task_assigned`.
+- The SQL dedupe-key expression the seed migration uses and
+  `task_assigned_dedupe_key` in Rust agree byte-for-byte, ASCII and non-ASCII
+  text alike — the seed migration is silently useless if they ever diverge.
+- Retention prunes read rows past 90 days and everything past 180, **except**
+  a read `task_assigned` row of the same age, which must survive; a same-age
+  `mention` row in the same test is the control that proves the exclusion is
+  kind-specific, not a floor that swallowed the whole prune.
+- Deleting a document cascades its notifications away.
+
+**`crates/knot-server/tests/notifications_sweep.rs`**
+
 - Sweep: an overdue task emits once, a second sweep in the same day no-ops, the
   next day emits again.
-- Retention prunes read rows past 90 days and everything past 180.
-- Deleting a document cascades its notifications away.
+- A checked task is never overdue.
+- **Reorder characterisation for `task_due`:** an overdue task notifies once;
+  inserting an unrelated item above it (shifting its `doc_tasks.id`) and
+  sweeping again the same day must not produce a second `task_due` — the same
+  hazard as the `task_assigned` reorder test, for the sweep's own key.
 
 **`crates/knot-server/tests/notifications_integration.rs`**
 
@@ -304,14 +389,28 @@ beside the existing metrics. The sweep logs its emit and prune counts at debug.
 - A comment carrying `mentions: [<uuid>]` notifies that user even though their
   display name contains a space; a comment sent without the field still resolves
   `@Alice` through the regex fallback.
+- A comment carrying one picked id **and** a hand-typed second `@name` in the
+  body notifies both — the union, not either/or, per §3.
 - An id in `mentions` for a non-member is rejected, not notified.
 - Granting access emits `doc_shared`.
 - The list endpoint omits rows whose doc access was revoked.
-- `unread_count` reports `capped: true` past 100.
-- `POST /read` with ids, and with `{all: true}`.
+- `POST /read` with ids, and with `{all: true}` — the latter exercised
+  end-to-end (two distinct unread rows, marked via `{"all": true}`, both
+  confirmed read) rather than only asserted at the store layer, since the
+  route's `ids` defaulting to `[]` and `all` to `false` means a wrong key name
+  degrades to a silent no-op that still returns 204.
+
+`unread_count`'s `capped: true` branch is covered as a small pure-function
+unit test in `crates/knot-server/src/routes/api/notifications.rs` (`is_capped`)
+rather than through the HTTP route, which would require provisioning 100 real
+unread rows for a user just to cross the hardcoded cap.
 
 **Vitest** — badge hidden at zero and capped at `99+`; dropdown rendering;
-optimistic mark-read.
+optimistic mark-read; an actor-less row (`task_due`, and `task_assigned` on
+the live-editing path) renders as a plain statement rather than attributing
+the product to itself as "knot"; a picked mention id whose name was
+backspaced back out of the comment body before submit is dropped, not
+notified.
 
 **`e2e/flows/notifications.spec.ts`** — two browser contexts. Alice comments
 `@Bob` on a doc Bob can read; Bob's badge appears, the dropdown lists it,

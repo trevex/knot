@@ -57,4 +57,35 @@ describe("CommentComposer mentions", () => {
     fireEvent.click(screen.getByTestId("composer-submit"));
     expect(onSubmit).toHaveBeenCalledWith("no mentions here", []);
   });
+
+  it("drops a picked id whose name was backspaced back out of the body", async () => {
+    const { onSubmit } = renderComposer();
+    const textarea = screen.getByTestId<HTMLTextAreaElement>("composer-input");
+
+    fireEvent.change(textarea, { target: { value: "@Car" } });
+    textarea.selectionStart = 4;
+    fireEvent.keyUp(textarea);
+    const row = await screen.findByTestId("mention-item");
+    fireEvent.mouseDown(row);
+    // Picking inserts "@Carol Danvers " — now remove her name entirely,
+    // as if the author backspaced it out, but left other text behind.
+    fireEvent.change(textarea, { target: { value: "never mind" } });
+
+    fireEvent.click(screen.getByTestId("composer-submit"));
+    expect(onSubmit).toHaveBeenCalledWith("never mind", []);
+  });
+
+  it("keeps a picked id whose name is still present in the body", async () => {
+    const { onSubmit } = renderComposer();
+    const textarea = screen.getByTestId<HTMLTextAreaElement>("composer-input");
+
+    fireEvent.change(textarea, { target: { value: "@Car" } });
+    textarea.selectionStart = 4;
+    fireEvent.keyUp(textarea);
+    const row = await screen.findByTestId("mention-item");
+    fireEvent.mouseDown(row);
+
+    fireEvent.click(screen.getByTestId("composer-submit"));
+    expect(onSubmit).toHaveBeenCalledWith("@Carol Danvers", [CAROL.user_id]);
+  });
 });

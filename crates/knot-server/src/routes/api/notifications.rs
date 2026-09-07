@@ -180,7 +180,7 @@ async fn unread_count(State(state): State<AppState>, req: Request) -> Response {
     match notifications.unread_count(ctx.user_id, UNREAD_CAP).await {
         Ok(n) => Json(CountResponse {
             count: n,
-            capped: n >= UNREAD_CAP,
+            capped: is_capped(n, UNREAD_CAP),
         })
         .into_response(),
         Err(e) => {
@@ -188,6 +188,15 @@ async fn unread_count(State(state): State<AppState>, req: Request) -> Response {
             internal()
         }
     }
+}
+
+/// Whether the badge should show the "+" suffix: `n` hit the `LIMIT` the
+/// store's `unread_count` query imposes, so the true count might be
+/// higher. Pulled out of the handler so the `true` branch has direct unit
+/// coverage — exercising it through the HTTP stack would mean actually
+/// creating `UNREAD_CAP` (100) rows for a user, which no existing test does.
+fn is_capped(n: i64, cap: i64) -> bool {
+    n >= cap
 }
 
 async fn mark_read(State(state): State<AppState>, req: Request<Body>) -> Response {
@@ -217,5 +226,21 @@ async fn mark_read(State(state): State<AppState>, req: Request<Body>) -> Respons
             tracing::error!(error=?e, "notifications mark_read");
             internal()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_capped;
+
+    #[test]
+    fn not_capped_below_the_limit() {
+        assert!(!is_capped(4, 5));
+    }
+
+    #[test]
+    fn capped_at_and_above_the_limit() {
+        assert!(is_capped(5, 5), "count == cap must already read as capped");
+        assert!(is_capped(6, 5));
     }
 }

@@ -161,13 +161,21 @@ impl TaskStore for PgTaskStore {
             // its id. Ids are "<doc_id>:<item_index>" and every reorder
             // rewrites them, so an id-keyed notification would re-fire for
             // every assignee each time anyone moved a list item.
+            //
+            // `!item.checked` matters beyond "don't notify about a task
+            // someone already finished": it is also what keeps an existing
+            // deployment's first reindex after this feature ships from
+            // notifying every assignee about their entire historical
+            // backlog of *completed* work. The still-open backlog is
+            // handled separately, by the seed migration that pre-populates
+            // dedupe rows for currently-unchecked assigned tasks (see
+            // migrations/20260907120000_notifications_kind_check_and_task_assigned_seed.sql).
             if let Some(assignee) = item.assignee_user_id
                 && Some(assignee) != actor_id
+                && !item.checked
             {
-                use sha2::{Digest, Sha256};
-                let digest = Sha256::digest(item.text.as_bytes());
-                let short = hex_prefix(&digest);
-                sqlx::query(
+                let dedupe_key = task_assigned_dedupe_key(doc_id, &item.text, assignee);
+                let res = sqlx::query(
                     "INSERT INTO notifications \
                        (workspace_id, user_id, actor_id, kind, doc_id, target_kind, target_id, dedupe_key, data) \
                      VALUES ($1, $2, $3, 'task_assigned', $4, 'task', $5, $6, $7) \
@@ -178,10 +186,22 @@ impl TaskStore for PgTaskStore {
                 .bind(actor_id)
                 .bind(doc_id)
                 .bind(&id)
-                .bind(format!("task_assigned:{doc_id}:{short}:{assignee}"))
-                .bind(serde_json::json!({ "text": item.text }))
+                .bind(&dedupe_key)
+                .bind(serde_json::json!({ "excerpt": item.text }))
                 .execute(&mut *tx)
                 .await?;
+
+                // This insert bypasses `NotificationStore::emit`, which is
+                // the only other place this counter is incremented — so
+                // without this, `task_assigned` never shows up in
+                // `knot_notifications_emitted_total` at all. Count only
+                // rows actually inserted, matching `emit`'s
+                // `rows_affected() == 1` check, so a deduped no-op doesn't
+                // inflate the counter.
+                if res.rows_affected() == 1 {
+                    metrics::counter!("knot_notifications_emitted_total", "kind" => "task_assigned")
+                        .increment(1);
+                }
             }
         }
 
@@ -237,6 +257,26 @@ impl TaskStore for PgTaskStore {
 /// key a notification without carrying the whole hash in every row.
 fn hex_prefix(digest: &[u8]) -> String {
     digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The content-addressed `dedupe_key` for a `task_assigned` notification:
+/// `task_assigned:<doc_id>:<first 8 bytes of sha256(text) as lowercase
+/// hex>:<assignee>`. Reordering a checklist changes `doc_tasks.id` but not
+/// this key; editing the text does.
+///
+/// `pub` (and re-exported from the crate root) purely so
+/// `crates/knot-storage/tests/notifications.rs` can assert this agrees,
+/// byte for byte, with the SQL expression the seed migration
+/// (`migrations/20260907120000_notifications_kind_check_and_task_assigned_seed.sql`)
+/// uses to pre-populate the same keys: `encode(substring(sha256(convert_to(text,
+/// 'UTF8')) from 1 for 8), 'hex')`. If the two ever disagree the seed
+/// migration is silently useless — it inserts rows under keys the runtime
+/// will never look up again.
+pub fn task_assigned_dedupe_key(doc_id: Uuid, text: &str, assignee: Uuid) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(text.as_bytes());
+    let short = hex_prefix(&digest);
+    format!("task_assigned:{doc_id}:{short}:{assignee}")
 }
 
 impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for DocTask {

@@ -464,6 +464,66 @@ async fn explicit_mention_ids_reach_a_user_whose_name_has_a_space() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn explicit_and_typed_mentions_union_instead_of_either_or() {
+    // Finding 6: picking one person from the mention picker then
+    // hand-typing a second `@name` (e.g. after a trailing space silently
+    // closed the picker) used to drop the typed name entirely, because a
+    // non-empty `mentions` list disabled the regex fallback outright.
+    let (state, ws, doc, _alice, bob) = seeded().await;
+    let cookie = login(&state, "alice@example.com").await;
+
+    // A member the display-name regex can never match on its own — proves
+    // the explicit id still works when unioned, not just when alone.
+    let hash = state.hasher.hash("hunter22").unwrap();
+    let carol = state
+        .users
+        .as_ref()
+        .unwrap()
+        .create_local("carol@example.com", "Carol Danvers", &hash)
+        .await
+        .unwrap();
+    state
+        .workspaces
+        .as_ref()
+        .unwrap()
+        .add_member(ws, carol.id, WorkspaceRole::Editor)
+        .await
+        .unwrap();
+
+    let (status, _) = post_json(
+        &state,
+        &cookie,
+        &format!("/api/docs/{doc}/comments"),
+        serde_json::json!({
+            "body": "over to you @Carol Danvers, and also @Bob",
+            "mentions": [carol.id.to_string()],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let notifications = state.notifications.as_ref().unwrap();
+    assert_eq!(
+        notifications
+            .list(carol.id, false, 50, None)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "the picked id must still notify"
+    );
+    assert_eq!(
+        notifications
+            .list(bob, false, 50, None)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "the hand-typed name must not be dropped just because `mentions` was non-empty"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn an_id_for_a_non_member_is_ignored() {
     let (state, _ws, doc, _alice, _bob) = seeded().await;
     let cookie = login(&state, "alice@example.com").await;
@@ -683,4 +743,65 @@ async fn a_row_for_a_doc_the_user_cannot_read_is_filtered_out() {
     let items = items["items"].as_array().unwrap();
     assert_eq!(items.len(), 1, "the unreadable row is filtered, not 403'd");
     assert_eq!(items[0]["kind"], "mention");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mark_read_with_all_true_clears_the_whole_inbox() {
+    // `POST /api/notifications/read {"all": true}` had no coverage at any
+    // level. `ids` defaults to `[]` and `all` to `false`, so a body that
+    // fails to deserialize as expected (e.g. a wrong key name) silently
+    // degrades to "mark nothing" and still returns 204 — the "Mark all
+    // read" button would appear to work and do nothing.
+    let (state, _ws, doc, _alice, bob) = seeded().await;
+    let alice_cookie = login(&state, "alice@example.com").await;
+    let bob_cookie = login(&state, "bob@example.com").await;
+
+    // Two distinct unread rows for Bob: a mention, and a direct grant.
+    post_json(
+        &state,
+        &alice_cookie,
+        &format!("/api/docs/{doc}/comments"),
+        serde_json::json!({ "body": "hey @Bob" }),
+    )
+    .await;
+    let app = router_with_state(state.clone());
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/docs/{doc}/grants/user:{bob}"))
+                .header("cookie", &alice_cookie)
+                .header("x-csrf-token", csrf_from(&alice_cookie))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "role": "editor", "inherit": true }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+    let (_, count) = get_json(&state, &bob_cookie, "/api/notifications/unread_count").await;
+    assert_eq!(count["count"], 2, "sanity: two unread rows before marking");
+
+    let (status, _) = post_json(
+        &state,
+        &bob_cookie,
+        "/api/notifications/read",
+        serde_json::json!({ "all": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (_, count) = get_json(&state, &bob_cookie, "/api/notifications/unread_count").await;
+    assert_eq!(count["count"], 0, "all: true must clear every unread row");
+
+    let (_, list) = get_json(&state, &bob_cookie, "/api/notifications").await;
+    let items = list["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert!(
+        items.iter().all(|i| i["read"] == true),
+        "every row must now be marked read: {items:?}"
+    );
 }
