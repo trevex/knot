@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Download, Eye, FileCode, History, LayoutTemplate, MessageSquare, Pencil, Share2 } from "lucide-react";
 import { lazy, Suspense, useEffect, useState, type CSSProperties } from "react";
-import { Link, Outlet, useNavigate, useParams } from "react-router-dom";
+import { Link, Outlet, useNavigate, useParams, useSearchParams } from "react-router-dom";
 
 import { useEffectiveRole } from "../../auth/useEffectiveRole";
 import { StatusDot, SyncStatus, type ConnStatus } from "../../components/StatusDot";
@@ -117,6 +117,20 @@ export default function DocPage() {
   }, [toggleDocWidth]);
   const commentSidebarOpen = useUi((s) => s.commentSidebarOpen);
   const openCommentSidebar = useUi((s) => s.openCommentSidebar);
+  const setActiveCommentId = useUi((s) => s.setActiveCommentId);
+
+  // Arriving from a notification: /doc/:id?thread=<uuid>. The sidebar's
+  // existing active-thread machinery (CommentThread.tsx) does the scrolling
+  // and the focus ring — this just opens the sidebar and points it at the
+  // thread. Keyed on the URL param alone so it fires once per navigation and
+  // doesn't fight a later in-sidebar thread click.
+  const [searchParams] = useSearchParams();
+  const threadParam = searchParams.get("thread");
+  useEffect(() => {
+    if (!threadParam) return;
+    openCommentSidebar();
+    setActiveCommentId(threadParam);
+  }, [threadParam, openCommentSidebar, setActiveCommentId]);
 
   const doc = useQuery({
     queryKey: ["doc", id],
