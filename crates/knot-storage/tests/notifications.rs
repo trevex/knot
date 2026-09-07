@@ -2,9 +2,9 @@
 //! `knot_test_support::fresh_db` against the dev compose Postgres.
 
 use knot_storage::{
-    DocStore, NewNotification, NotificationKind, NotificationStore, PgDocStore,
-    PgNotificationStore, PgUserStore, PgWorkspaceStore, UserStore, WorkspaceRole, WorkspaceStore,
-    sort_key_between,
+    DocStore, DocTaskInput, NewNotification, NotificationKind, NotificationStore, PgDocStore,
+    PgNotificationStore, PgTaskStore, PgUserStore, PgWorkspaceStore, TaskStore, UserStore,
+    WorkspaceRole, WorkspaceStore, sort_key_between,
 };
 use uuid::Uuid;
 
@@ -231,4 +231,160 @@ async fn deleting_a_doc_cascades_its_notifications() {
         .unwrap();
     hard_delete_doc(&store, doc).await;
     assert!(store.list(bob, false, 50, None).await.unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn assigning_a_task_notifies_once_and_survives_a_reorder() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let ws = PgWorkspaceStore::new(pool.clone())
+        .create("default", "W")
+        .await
+        .unwrap();
+    let users = PgUserStore::new(pool.clone());
+    let alice = users
+        .create_local("alice@x.test", "Alice", "$h$")
+        .await
+        .unwrap();
+    let bob = users
+        .create_local("bob@x.test", "Bob", "$h$")
+        .await
+        .unwrap();
+    let ws_store = PgWorkspaceStore::new(pool.clone());
+    ws_store
+        .add_member(ws.id, alice.id, WorkspaceRole::Owner)
+        .await
+        .unwrap();
+    ws_store
+        .add_member(ws.id, bob.id, WorkspaceRole::Editor)
+        .await
+        .unwrap();
+    let docs = PgDocStore::new(pool.clone());
+    let doc = docs
+        .create(ws.id, None, "Doc", &sort_key_between(None, None), alice.id)
+        .await
+        .unwrap();
+
+    let tasks = PgTaskStore::new(pool.clone());
+    let notifications = PgNotificationStore::new(pool.clone());
+
+    let ship = DocTaskInput {
+        item_index: 0,
+        text: "ship it".into(),
+        assignee_user_id: Some(bob.id),
+        checked: false,
+        due_at: None,
+    };
+    let review = DocTaskInput {
+        item_index: 1,
+        text: "review it".into(),
+        assignee_user_id: Some(bob.id),
+        checked: false,
+        due_at: None,
+    };
+
+    tasks
+        .upsert_for_doc(
+            ws.id,
+            doc.id,
+            &[ship.clone(), review.clone()],
+            Some(alice.id),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        notifications
+            .list(bob.id, false, 50, None)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // Swap the two items. Every task id changes; no new notifications.
+    let swapped = vec![
+        DocTaskInput {
+            item_index: 0,
+            ..review.clone()
+        },
+        DocTaskInput {
+            item_index: 1,
+            ..ship.clone()
+        },
+    ];
+    tasks
+        .upsert_for_doc(ws.id, doc.id, &swapped, Some(alice.id))
+        .await
+        .unwrap();
+    assert_eq!(
+        notifications
+            .list(bob.id, false, 50, None)
+            .await
+            .unwrap()
+            .len(),
+        2,
+        "reordering a list must not re-notify"
+    );
+
+    // Editing the text is a new task as far as the key is concerned.
+    let edited = vec![DocTaskInput {
+        text: "ship it today".into(),
+        ..ship.clone()
+    }];
+    tasks
+        .upsert_for_doc(ws.id, doc.id, &edited, Some(alice.id))
+        .await
+        .unwrap();
+    assert_eq!(
+        notifications
+            .list(bob.id, false, 50, None)
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn assigning_a_task_to_yourself_notifies_nobody() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let ws = PgWorkspaceStore::new(pool.clone())
+        .create("default", "W")
+        .await
+        .unwrap();
+    let alice = PgUserStore::new(pool.clone())
+        .create_local("alice@x.test", "Alice", "$h$")
+        .await
+        .unwrap();
+    PgWorkspaceStore::new(pool.clone())
+        .add_member(ws.id, alice.id, WorkspaceRole::Owner)
+        .await
+        .unwrap();
+    let doc = PgDocStore::new(pool.clone())
+        .create(ws.id, None, "Doc", &sort_key_between(None, None), alice.id)
+        .await
+        .unwrap();
+
+    PgTaskStore::new(pool.clone())
+        .upsert_for_doc(
+            ws.id,
+            doc.id,
+            &[DocTaskInput {
+                item_index: 0,
+                text: "mine".into(),
+                assignee_user_id: Some(alice.id),
+                checked: false,
+                due_at: None,
+            }],
+            Some(alice.id),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        PgNotificationStore::new(pool)
+            .list(alice.id, false, 50, None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }

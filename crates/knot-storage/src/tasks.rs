@@ -50,11 +50,16 @@ pub trait TaskStore: Send + Sync + 'static {
     /// Replace the task set for `doc_id` with `items`. Rows that fell out
     /// of the new set are deleted. `completed_at` is preserved across
     /// re-indexing when the checked status doesn't change.
+    ///
+    /// `actor_id` is whoever's edit triggered the reindex; it becomes the
+    /// actor on any `task_assigned` notification, and suppresses the
+    /// notification when someone assigns a task to themselves.
     async fn upsert_for_doc(
         &self,
         workspace_id: Uuid,
         doc_id: Uuid,
         items: &[DocTaskInput],
+        actor_id: Option<Uuid>,
     ) -> Result<()>;
 
     /// All open (uncompleted) tasks for a user across the workspace.
@@ -90,6 +95,7 @@ impl TaskStore for PgTaskStore {
         workspace_id: Uuid,
         doc_id: Uuid,
         items: &[DocTaskInput],
+        actor_id: Option<Uuid>,
     ) -> Result<()> {
         let mut tx = crate::begin(&self.pool).await?;
 
@@ -143,6 +149,33 @@ impl TaskStore for PgTaskStore {
             .bind(item.due_at)
             .execute(&mut *tx)
             .await?;
+
+            // Notify a new assignee — but key on the task's *content*, not
+            // its id. Ids are "<doc_id>:<item_index>" and every reorder
+            // rewrites them, so an id-keyed notification would re-fire for
+            // every assignee each time anyone moved a list item.
+            if let Some(assignee) = item.assignee_user_id
+                && Some(assignee) != actor_id
+            {
+                use sha2::{Digest, Sha256};
+                let digest = Sha256::digest(item.text.as_bytes());
+                let short = hex_prefix(&digest);
+                sqlx::query(
+                    "INSERT INTO notifications \
+                       (workspace_id, user_id, actor_id, kind, doc_id, target_kind, target_id, dedupe_key, data) \
+                     VALUES ($1, $2, $3, 'task_assigned', $4, 'task', $5, $6, $7) \
+                     ON CONFLICT (user_id, dedupe_key) DO NOTHING",
+                )
+                .bind(workspace_id)
+                .bind(assignee)
+                .bind(actor_id)
+                .bind(doc_id)
+                .bind(&id)
+                .bind(format!("task_assigned:{doc_id}:{short}:{assignee}"))
+                .bind(serde_json::json!({ "text": item.text }))
+                .execute(&mut *tx)
+                .await?;
+            }
         }
 
         tx.commit().await?;
@@ -191,6 +224,12 @@ impl TaskStore for PgTaskStore {
         .await?;
         Ok(rows)
     }
+}
+
+/// First 8 bytes of a digest as lowercase hex — 16 characters, enough to
+/// key a notification without carrying the whole hash in every row.
+fn hex_prefix(digest: &[u8]) -> String {
+    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for DocTask {
