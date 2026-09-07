@@ -59,11 +59,19 @@ struct CreateThreadBody {
     position_y_end: Option<String>,
     #[serde(default)]
     anchor_text: Option<String>,
+    /// User ids the client's mention picker resolved. Preferred over the
+    /// display-name regex, which cannot match a name containing a space.
+    #[serde(default)]
+    mentions: Vec<Uuid>,
 }
 
 #[derive(Deserialize)]
 struct CreateReplyBody {
     body: String,
+    /// User ids the client's mention picker resolved. Preferred over the
+    /// display-name regex, which cannot match a name containing a space.
+    #[serde(default)]
+    mentions: Vec<Uuid>,
 }
 
 #[derive(Deserialize)]
@@ -157,6 +165,7 @@ enum CommentWrite {
 /// Runs after the comment has committed, so a crash in between loses the
 /// notification. That is the same at-most-once behaviour the previous
 /// `pg_notify` had, and a trait object cannot join the caller's transaction.
+#[allow(clippy::too_many_arguments)] // cohesive set of comment-write context
 async fn emit_comment_notifications(
     state: &AppState,
     doc_id: Uuid,
@@ -165,6 +174,7 @@ async fn emit_comment_notifications(
     author_id: Uuid,
     body: &str,
     write: CommentWrite,
+    explicit: &[Uuid],
 ) {
     let (Some(notifications), Some(docs), Some(workspaces), Some(comments)) = (
         state.notifications.clone(),
@@ -178,19 +188,28 @@ async fn emit_comment_notifications(
         return;
     };
 
-    // Mentioned users: match handles against member display names.
-    let handles = extract_mentions(body);
-    let mut mentioned: Vec<Uuid> = Vec::new();
-    if !handles.is_empty() {
-        let Ok(members) = workspaces.list_members(doc.workspace_id).await else {
-            return;
-        };
-        mentioned = members
-            .into_iter()
+    // Explicit ids from the picker win; the regex is the fallback for
+    // clients that don't send them (and every comment written before this
+    // shipped). Either way, membership decides — an id for a non-member is
+    // dropped rather than trusted.
+    let members = match workspaces.list_members(doc.workspace_id).await {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    let mentioned: Vec<Uuid> = if explicit.is_empty() {
+        let handles = extract_mentions(body);
+        members
+            .iter()
             .filter(|m| handles.contains(&m.display_name.to_lowercase()))
             .map(|m| m.user_id)
-            .collect();
-    }
+            .collect()
+    } else {
+        members
+            .iter()
+            .filter(|m| explicit.contains(&m.user_id))
+            .map(|m| m.user_id)
+            .collect()
+    };
 
     let excerpt: String = body.chars().take(140).collect();
     let base_data = serde_json::json!({
@@ -333,6 +352,7 @@ async fn create_thread(
     let Some(comments) = state.comments.clone() else {
         return internal();
     };
+    let explicit = body_req.mentions.clone();
     match comments
         .create_thread(
             doc_id,
@@ -357,6 +377,7 @@ async fn create_thread(
                 ctx.user_id,
                 &body_text,
                 CommentWrite::Created,
+                &explicit,
             )
             .await;
             notify_comment_change(&state, doc_id);
@@ -402,6 +423,7 @@ async fn create_reply(
     let Some(comments) = state.comments.clone() else {
         return internal();
     };
+    let explicit = body_req.mentions.clone();
     match comments
         .create_reply(doc_id, thread_id, ctx.user_id, &body_req.body)
         .await
@@ -419,6 +441,7 @@ async fn create_reply(
                 ctx.user_id,
                 &body_text,
                 CommentWrite::Created,
+                &explicit,
             )
             .await;
             notify_comment_change(&state, doc_id);
@@ -697,6 +720,7 @@ async fn edit_comment(
                 ctx.user_id,
                 &body_text,
                 CommentWrite::Edited,
+                &[],
             )
             .await;
             notify_comment_change(&state, doc_id);

@@ -417,3 +417,111 @@ async fn granting_access_notifies_the_grantee() {
     assert_eq!(rows[0].kind, "doc_shared");
     assert_eq!(rows[0].doc_id, Some(doc));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn explicit_mention_ids_reach_a_user_whose_name_has_a_space() {
+    let (state, ws, doc, _alice, _bob) = seeded().await;
+    let cookie = login(&state, "alice@example.com").await;
+
+    // A member the display-name regex can never match.
+    let hash = state.hasher.hash("hunter22").unwrap();
+    let carol = state
+        .users
+        .as_ref()
+        .unwrap()
+        .create_local("carol@example.com", "Carol Danvers", &hash)
+        .await
+        .unwrap();
+    state
+        .workspaces
+        .as_ref()
+        .unwrap()
+        .add_member(ws, carol.id, WorkspaceRole::Editor)
+        .await
+        .unwrap();
+
+    let (status, _) = post_json(
+        &state,
+        &cookie,
+        &format!("/api/docs/{doc}/comments"),
+        serde_json::json!({
+            "body": "over to you @Carol Danvers",
+            "mentions": [carol.id.to_string()],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let rows = state
+        .notifications
+        .as_ref()
+        .unwrap()
+        .list(carol.id, false, 50, None)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].kind, "mention");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_id_for_a_non_member_is_ignored() {
+    let (state, _ws, doc, _alice, _bob) = seeded().await;
+    let cookie = login(&state, "alice@example.com").await;
+
+    // A real user who is not a member of this workspace.
+    let hash = state.hasher.hash("hunter22").unwrap();
+    let outsider = state
+        .users
+        .as_ref()
+        .unwrap()
+        .create_local("mallory@example.com", "Mallory", &hash)
+        .await
+        .unwrap();
+
+    let (status, _) = post_json(
+        &state,
+        &cookie,
+        &format!("/api/docs/{doc}/comments"),
+        serde_json::json!({ "body": "hi", "mentions": [outsider.id.to_string()] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    assert!(
+        state
+            .notifications
+            .as_ref()
+            .unwrap()
+            .list(outsider.id, false, 50, None)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a non-member must not be notified"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_comment_without_the_field_still_resolves_by_display_name() {
+    let (state, _ws, doc, _alice, bob) = seeded().await;
+    let cookie = login(&state, "alice@example.com").await;
+
+    let (status, _) = post_json(
+        &state,
+        &cookie,
+        &format!("/api/docs/{doc}/comments"),
+        serde_json::json!({ "body": "ping @Bob" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(
+        state
+            .notifications
+            .as_ref()
+            .unwrap()
+            .list(bob, false, 50, None)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
