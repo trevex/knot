@@ -136,6 +136,32 @@ task is arguably a new task, and the alternative (tracking identity across
 reorders) is a much larger change to a table whose id scheme documents itself as
 intentionally unstable.
 
+Two consequences of that key are accepted rather than fixed.
+
+**Identical task text does not notify twice.** Two checklist items reading
+"Follow up", assigned to the same person in the same document, hash to the same
+key, so only the first notifies. Adding `item_index` to disambiguate them would
+reintroduce the re-notify-on-every-reorder bug the key exists to prevent. The
+assignee still sees both on `/tasks`.
+
+**Self-assignment is not suppressed on the live-editing path.** `emit`'s
+`actor_id == user_id` guard needs an actor, and the path a real edit takes has
+none: `Room::on_inbound` persists WebSocket updates with `by_user_id: None`
+(`crates/knot-crdt/src/room.rs:586`, deliberately fire-and-forget), and the
+dirty channel feeding the reindex worker is an `mpsc::Sender<Uuid>` carrying a
+document id and nothing else. So `refresh_markdown_and_index` passes
+`actor_id: None`, and typing a checklist item that assigns you a task notifies
+you about it. The guard still works on the import paths, where the request
+carries `ctx.user_id`.
+
+Threading identity through the collaborative hot path to close this is not worth
+it, and would not clearly be correct: under co-editing, several people may have
+edited between two reindexes, and whoever typed the mention need not be the last
+writer, so "who assigned this" has no single answer. A `task_assigned` row with
+a NULL actor renders as "task assigned to you" with no actor name, which is
+accurate. `crates/knot-storage/tests/notifications.rs` pins this behaviour so it
+stays deliberate.
+
 ### 3. Comment mention identity
 
 Document mentions already carry exact identity: `MentionExtension.ts:33` inserts

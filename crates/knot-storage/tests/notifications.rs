@@ -249,6 +249,10 @@ async fn assigning_a_task_notifies_once_and_survives_a_reorder() {
         .create_local("bob@x.test", "Bob", "$h$")
         .await
         .unwrap();
+    let carol = users
+        .create_local("carol@x.test", "Carol", "$h$")
+        .await
+        .unwrap();
     let ws_store = PgWorkspaceStore::new(pool.clone());
     ws_store
         .add_member(ws.id, alice.id, WorkspaceRole::Owner)
@@ -256,6 +260,10 @@ async fn assigning_a_task_notifies_once_and_survives_a_reorder() {
         .unwrap();
     ws_store
         .add_member(ws.id, bob.id, WorkspaceRole::Editor)
+        .await
+        .unwrap();
+    ws_store
+        .add_member(ws.id, carol.id, WorkspaceRole::Editor)
         .await
         .unwrap();
     let docs = PgDocStore::new(pool.clone());
@@ -267,6 +275,12 @@ async fn assigning_a_task_notifies_once_and_survives_a_reorder() {
     let tasks = PgTaskStore::new(pool.clone());
     let notifications = PgNotificationStore::new(pool.clone());
 
+    // Different assignees per item on purpose: after the swap below, each
+    // task id ("<doc_id>:<item_index>") is paired with a (text, assignee)
+    // combination it has never held before. If both items shared one
+    // assignee, an id-keyed dedupe scheme would report the same
+    // notification counts as the content-keyed one and this test would
+    // pass even against that regression.
     let ship = DocTaskInput {
         item_index: 0,
         text: "ship it".into(),
@@ -277,7 +291,7 @@ async fn assigning_a_task_notifies_once_and_survives_a_reorder() {
     let review = DocTaskInput {
         item_index: 1,
         text: "review it".into(),
-        assignee_user_id: Some(bob.id),
+        assignee_user_id: Some(carol.id),
         checked: false,
         due_at: None,
     };
@@ -297,10 +311,23 @@ async fn assigning_a_task_notifies_once_and_survives_a_reorder() {
             .await
             .unwrap()
             .len(),
-        2
+        1
+    );
+    assert_eq!(
+        notifications
+            .list(carol.id, false, 50, None)
+            .await
+            .unwrap()
+            .len(),
+        1
     );
 
-    // Swap the two items. Every task id changes; no new notifications.
+    // Swap the two items: "ship it" moves to index 1, "review it" moves to
+    // index 0. Every task id changes, and — because the assignees differ —
+    // each id is now paired with an assignee it never held before either
+    // (id 0 was ship/bob, is now review/carol; id 1 was review/carol, is
+    // now ship/bob). An id-keyed dedupe would treat both as brand-new
+    // assignments and re-notify; content-keyed dedupe must not.
     let swapped = vec![
         DocTaskInput {
             item_index: 0,
@@ -321,14 +348,24 @@ async fn assigning_a_task_notifies_once_and_survives_a_reorder() {
             .await
             .unwrap()
             .len(),
-        2,
+        1,
+        "reordering a list must not re-notify"
+    );
+    assert_eq!(
+        notifications
+            .list(carol.id, false, 50, None)
+            .await
+            .unwrap()
+            .len(),
+        1,
         "reordering a list must not re-notify"
     );
 
     // Editing the text is a new task as far as the key is concerned.
+    // "ship it" now lives at item_index 1, still assigned to bob.
     let edited = vec![DocTaskInput {
         text: "ship it today".into(),
-        ..ship.clone()
+        ..swapped[1].clone()
     }];
     tasks
         .upsert_for_doc(ws.id, doc.id, &edited, Some(alice.id))
@@ -340,7 +377,68 @@ async fn assigning_a_task_notifies_once_and_survives_a_reorder() {
             .await
             .unwrap()
             .len(),
-        3
+        2
+    );
+    assert_eq!(
+        notifications
+            .list(carol.id, false, 50, None)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn assignment_with_no_known_actor_still_notifies() {
+    // Live edits arrive through the reindex worker (crates/knot-server/src/
+    // reindex.rs), which only ever has a doc id, never an editor identity —
+    // so `refresh_markdown_and_index` always calls `upsert_for_doc` with
+    // `actor_id: None` on that path. The self-assignment guard compares
+    // the assignee against `actor_id`, so with `actor_id: None` it can
+    // never suppress: this pins that deliberate limitation, not a bug.
+    let pool = knot_test_support::fresh_db().await.pool;
+    let ws = PgWorkspaceStore::new(pool.clone())
+        .create("default", "W")
+        .await
+        .unwrap();
+    let alice = PgUserStore::new(pool.clone())
+        .create_local("alice@x.test", "Alice", "$h$")
+        .await
+        .unwrap();
+    PgWorkspaceStore::new(pool.clone())
+        .add_member(ws.id, alice.id, WorkspaceRole::Owner)
+        .await
+        .unwrap();
+    let doc = PgDocStore::new(pool.clone())
+        .create(ws.id, None, "Doc", &sort_key_between(None, None), alice.id)
+        .await
+        .unwrap();
+
+    PgTaskStore::new(pool.clone())
+        .upsert_for_doc(
+            ws.id,
+            doc.id,
+            &[DocTaskInput {
+                item_index: 0,
+                text: "assigned to myself with no known actor".into(),
+                assignee_user_id: Some(alice.id),
+                checked: false,
+                due_at: None,
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        PgNotificationStore::new(pool)
+            .list(alice.id, false, 50, None)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "actor_id: None can't suppress self-assignment — that's the live-edit path"
     );
 }
 

@@ -51,9 +51,16 @@ pub trait TaskStore: Send + Sync + 'static {
     /// of the new set are deleted. `completed_at` is preserved across
     /// re-indexing when the checked status doesn't change.
     ///
-    /// `actor_id` is whoever's edit triggered the reindex; it becomes the
-    /// actor on any `task_assigned` notification, and suppresses the
-    /// notification when someone assigns a task to themselves.
+    /// `actor_id` is whoever's edit triggered the reindex, when known; it
+    /// becomes the actor on any `task_assigned` notification, and
+    /// suppresses the notification when someone assigns a task to
+    /// themselves. It is `None` on the live-editing path — the CRDT room
+    /// persists updates without an editor identity, and the reindex worker
+    /// that drains its dirty-doc channel receives only a doc id — so
+    /// self-assignment is **not** suppressed there: a task assigned to
+    /// yourself while co-editing still produces a `task_assigned` row with
+    /// a NULL actor. The guard only has an effect on paths that pass a real
+    /// actor, currently the markdown/workspace import handlers.
     async fn upsert_for_doc(
         &self,
         workspace_id: Uuid,
