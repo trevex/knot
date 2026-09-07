@@ -525,3 +525,162 @@ async fn a_comment_without_the_field_still_resolves_by_display_name() {
         1
     );
 }
+
+async fn get_json(state: &AppState, cookie: &str, uri: &str) -> (StatusCode, serde_json::Value) {
+    let app = router_with_state(state.clone());
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let json = if bytes.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+    };
+    (status, json)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inbox_lists_counts_and_marks_read() {
+    let (state, _ws, doc, _alice, _bob) = seeded().await;
+    let alice_cookie = login(&state, "alice@example.com").await;
+    let bob_cookie = login(&state, "bob@example.com").await;
+
+    post_json(
+        &state,
+        &alice_cookie,
+        &format!("/api/docs/{doc}/comments"),
+        serde_json::json!({ "body": "hey @Bob" }),
+    )
+    .await;
+
+    let (status, count) = get_json(&state, &bob_cookie, "/api/notifications/unread_count").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(count["count"], 1);
+    assert_eq!(count["capped"], false);
+
+    let (status, list) = get_json(&state, &bob_cookie, "/api/notifications?filter=unread").await;
+    assert_eq!(status, StatusCode::OK);
+    let items = list["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["kind"], "mention");
+    assert_eq!(items[0]["doc_title"], "Test Doc");
+    assert_eq!(items[0]["actor_display_name"], "Alice");
+    assert_eq!(items[0]["read"], false);
+    let id = items[0]["id"].as_i64().unwrap();
+
+    let (status, _) = post_json(
+        &state,
+        &bob_cookie,
+        "/api/notifications/read",
+        serde_json::json!({ "ids": [id] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (_, count) = get_json(&state, &bob_cookie, "/api/notifications/unread_count").await;
+    assert_eq!(count["count"], 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_inbox_is_per_user() {
+    let (state, _ws, doc, _alice, _bob) = seeded().await;
+    let alice_cookie = login(&state, "alice@example.com").await;
+    post_json(
+        &state,
+        &alice_cookie,
+        &format!("/api/docs/{doc}/comments"),
+        serde_json::json!({ "body": "hey @Bob" }),
+    )
+    .await;
+
+    // Alice sees nothing — the row belongs to Bob.
+    let (_, list) = get_json(&state, &alice_cookie, "/api/notifications").await;
+    assert!(list["items"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_row_for_a_doc_the_user_cannot_read_is_filtered_out() {
+    let (state, _ws, doc, _alice, bob) = seeded().await;
+    let alice_cookie = login(&state, "alice@example.com").await;
+    let bob_cookie = login(&state, "bob@example.com").await;
+
+    post_json(
+        &state,
+        &alice_cookie,
+        &format!("/api/docs/{doc}/comments"),
+        serde_json::json!({ "body": "hey @Bob" }),
+    )
+    .await;
+    assert_eq!(
+        get_json(&state, &bob_cookie, "/api/notifications").await.1["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // A notification pointing at a document Bob cannot read. Workspace
+    // membership grants a role on every doc in that workspace
+    // (knot_docs::acl::resolve), so the way to be unable to read a doc is
+    // for it to live in another workspace — which is exactly the tenancy
+    // guard at acl.rs:59-62, and the same `effective_role` -> None branch a
+    // revoked grant produces.
+    let other_ws = state
+        .workspaces
+        .as_ref()
+        .unwrap()
+        .create("other", "Other")
+        .await
+        .unwrap();
+    let other_doc = state
+        .docs
+        .as_ref()
+        .unwrap()
+        .create(other_ws.id, None, "Elsewhere", "m", bob)
+        .await
+        .unwrap();
+    state
+        .notifications
+        .as_ref()
+        .unwrap()
+        .emit(&knot_storage::NewNotification {
+            workspace_id: other_ws.id,
+            user_id: bob,
+            actor_id: None,
+            kind: knot_storage::NotificationKind::DocShared,
+            doc_id: Some(other_doc.id),
+            target_kind: "document".into(),
+            target_id: other_doc.id.to_string(),
+            dedupe_key: format!("share:{}:{bob}", other_doc.id),
+            data: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+
+    // Two rows exist for Bob; the endpoint returns only the readable one.
+    assert_eq!(
+        state
+            .notifications
+            .as_ref()
+            .unwrap()
+            .list(bob, false, 50, None)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    let items = get_json(&state, &bob_cookie, "/api/notifications").await.1;
+    let items = items["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "the unreadable row is filtered, not 403'd");
+    assert_eq!(items[0]["kind"], "mention");
+}
