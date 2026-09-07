@@ -1,5 +1,5 @@
 import { Bell, CheckSquare, LayoutTemplate, Search, Settings, Users } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { useSession } from "../../auth/SessionContext";
@@ -14,6 +14,36 @@ export function WorkspaceHeader() {
   const unread = useUnreadCount();
   const badge = unread.data ? formatBadge(unread.data.count, unread.data.capped) : "";
   const [inboxOpen, setInboxOpen] = useState(false);
+  const inboxTriggerRef = useRef<HTMLButtonElement>(null);
+  const inboxContainerRef = useRef<HTMLDivElement>(null);
+
+  // Dismiss the dropdown on an outside click or Escape. Owned here, not in
+  // NotificationDropdown, because this component already holds a ref that
+  // covers both the trigger button and the dropdown (they're siblings under
+  // inboxContainerRef) — so a click on the trigger itself is naturally
+  // "inside" and never fights with the trigger's own onClick toggle. The
+  // effect keys off the `inboxOpen` boolean rather than a fresh onClose
+  // closure, so it doesn't tear down and reattach on every unrelated
+  // re-render (e.g. the 30s unread-count poll) while the dropdown is open.
+  useEffect(() => {
+    if (!inboxOpen) return;
+    const dismiss = () => {
+      setInboxOpen(false);
+      inboxTriggerRef.current?.focus();
+    };
+    const onDoc = (e: MouseEvent) => {
+      if (!inboxContainerRef.current?.contains(e.target as Node)) dismiss();
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") dismiss();
+    };
+    document.addEventListener("mousedown", onDoc);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDoc);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [inboxOpen]);
 
   const initial = (user?.display_name ?? "?").slice(0, 1).toUpperCase();
 
@@ -42,10 +72,13 @@ export function WorkspaceHeader() {
         <span className="ml-auto text-[11px] text-fg-muted/80">⌘K</span>
       </button>
       <nav className="mt-2 flex flex-col gap-0.5">
-        <div className="relative">
+        <div className="relative" ref={inboxContainerRef}>
           <button
             type="button"
+            ref={inboxTriggerRef}
             data-testid="sidebar-inbox"
+            aria-haspopup="menu"
+            aria-expanded={inboxOpen}
             onClick={() => setInboxOpen((v) => !v)}
             className="inline-flex items-center gap-2 h-7 px-2 rounded text-[13px] text-fg-muted hover:text-fg hover:bg-muted transition-colors ease-swift duration-150"
           >

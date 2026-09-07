@@ -32,6 +32,7 @@ export default function NotificationsPage() {
         <button
           type="button"
           data-testid="notifications-filter-all"
+          aria-pressed={filter === "all"}
           onClick={() => setFilter("all")}
           className={`h-7 px-2 rounded text-[13px] ${filter === "all" ? "bg-muted text-fg" : "text-fg-muted hover:text-fg"}`}
         >
@@ -40,6 +41,7 @@ export default function NotificationsPage() {
         <button
           type="button"
           data-testid="notifications-filter-unread"
+          aria-pressed={filter === "unread"}
           onClick={() => setFilter("unread")}
           className={`h-7 px-2 rounded text-[13px] ${filter === "unread" ? "bg-muted text-fg" : "text-fg-muted hover:text-fg"}`}
         >

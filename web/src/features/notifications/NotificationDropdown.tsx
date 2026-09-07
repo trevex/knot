@@ -1,10 +1,11 @@
 /**
- * The sidebar's Inbox dropdown — the last 10, unread first by recency.
- * Clicking a row marks it read and navigates; "Open inbox" goes to the
- * full page. Dismisses on an outside click or Escape, matching the
- * ContextMenu convention used elsewhere in the app.
+ * The sidebar's Inbox dropdown — the most recent 10 notifications, newest
+ * first (the server orders by id DESC; nothing here re-sorts by read
+ * state). Clicking a row marks it read and navigates; "Open inbox" goes to
+ * the full page. Dismissal (outside click / Escape) is owned by
+ * WorkspaceHeader, which holds both the trigger button and this dropdown
+ * under one container ref — see the effect there.
  */
-import { useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 
 import type { Notification } from "../../lib/notifications.api";
@@ -15,28 +16,6 @@ export function NotificationDropdown({ onClose }: { onClose: () => void }) {
   const list = useNotificationList("all");
   const markRead = useMarkRead();
   const nav = useNavigate();
-  const ref = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    const onDoc = (e: MouseEvent) => {
-      const target = e.target as HTMLElement;
-      if (ref.current?.contains(target)) return;
-      // The trigger button owns its own toggle; without this guard a click
-      // that re-closes an open dropdown would fire this mousedown listener
-      // first (closing it), then the button's click handler (reopening it).
-      if (target.closest('[data-testid="sidebar-inbox"]')) return;
-      onClose();
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    document.addEventListener("mousedown", onDoc);
-    document.addEventListener("keydown", onKey);
-    return () => {
-      document.removeEventListener("mousedown", onDoc);
-      document.removeEventListener("keydown", onKey);
-    };
-  }, [onClose]);
 
   function open(n: Notification) {
     if (!n.read) markRead.mutate([n.id]);
@@ -49,7 +28,7 @@ export function NotificationDropdown({ onClose }: { onClose: () => void }) {
 
   return (
     <div
-      ref={ref}
+      role="menu"
       data-testid="notifications-dropdown"
       className="absolute left-2 right-2 top-full z-50 mt-1 rounded-md border border-border bg-surface shadow-lg overflow-hidden"
     >
@@ -61,6 +40,7 @@ export function NotificationDropdown({ onClose }: { onClose: () => void }) {
           <li key={n.id}>
             <button
               type="button"
+              role="menuitem"
               data-testid="notification-row"
               data-kind={n.kind}
               data-read={n.read ? "true" : "false"}
@@ -79,6 +59,7 @@ export function NotificationDropdown({ onClose }: { onClose: () => void }) {
       </ul>
       <button
         type="button"
+        role="menuitem"
         data-testid="notifications-open-inbox"
         onClick={() => {
           onClose();
