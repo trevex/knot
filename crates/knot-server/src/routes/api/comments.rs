@@ -138,60 +138,104 @@ fn extract_mentions(body: &str) -> Vec<String> {
         .collect()
 }
 
-/// Fire-and-forget mention notification via Postgres LISTEN/NOTIFY channel
-/// `comment_mentions`. Payload: JSON `{type, doc_id, comment_id, user_ids}`.
-async fn broadcast_mentions(state: &AppState, doc_id: Uuid, comment_id: Uuid, body: &str) {
+/// Write inbox rows for a new comment: `mention` for everyone named in the
+/// body, `reply` for the thread's other participants. A user who is both
+/// gets the mention only.
+///
+/// Runs after the comment has committed, so a crash in between loses the
+/// notification. That is the same at-most-once behaviour the previous
+/// `pg_notify` had, and a trait object cannot join the caller's transaction.
+async fn emit_comment_notifications(
+    state: &AppState,
+    doc_id: Uuid,
+    thread_id: Uuid,
+    comment_id: Uuid,
+    author_id: Uuid,
+    body: &str,
+) {
+    let (Some(notifications), Some(docs), Some(workspaces), Some(comments)) = (
+        state.notifications.clone(),
+        state.docs.clone(),
+        state.workspaces.clone(),
+        state.comments.clone(),
+    ) else {
+        return;
+    };
+    let Ok(Some(doc)) = docs.get(doc_id).await else {
+        return;
+    };
+
+    // Mentioned users: match handles against member display names.
     let handles = extract_mentions(body);
-    if handles.is_empty() {
-        return;
+    let mut mentioned: Vec<Uuid> = Vec::new();
+    if !handles.is_empty() {
+        let Ok(members) = workspaces.list_members(doc.workspace_id).await else {
+            return;
+        };
+        mentioned = members
+            .into_iter()
+            .filter(|m| handles.contains(&m.display_name.to_lowercase()))
+            .map(|m| m.user_id)
+            .collect();
     }
-    let Some(workspaces) = state.workspaces.clone() else {
-        return;
-    };
-    let Some(ctx) = state.pool.as_ref() else {
-        return;
-    };
-    // We need the workspace_id. Fetch from doc state via the docs store.
-    // Actually we need workspace_id for list_members; look it up via the doc.
-    let Some(docs) = state.docs.clone() else {
-        return;
-    };
-    let ws_id = match docs.get(doc_id).await {
-        Ok(Some(d)) => d.workspace_id,
-        Ok(None) => return,
-        Err(_) => return,
-    };
-    let members = match workspaces.list_members(ws_id).await {
-        Ok(m) => m,
-        Err(_) => return,
-    };
-    let user_ids: Vec<Uuid> = members
-        .into_iter()
-        .filter(|m| handles.contains(&m.display_name.to_lowercase()))
-        .map(|m| m.user_id)
+
+    let excerpt: String = body.chars().take(140).collect();
+    let base_data = serde_json::json!({
+        "excerpt": excerpt,
+        "doc_title": doc.title,
+        "thread_id": thread_id.to_string(),
+    });
+
+    let mut batch: Vec<knot_storage::NewNotification> = mentioned
+        .iter()
+        .map(|&uid| knot_storage::NewNotification {
+            workspace_id: doc.workspace_id,
+            user_id: uid,
+            actor_id: Some(author_id),
+            kind: knot_storage::NotificationKind::Mention,
+            doc_id: Some(doc_id),
+            target_kind: "comment".into(),
+            target_id: comment_id.to_string(),
+            dedupe_key: format!("mention:{comment_id}"),
+            data: base_data.clone(),
+        })
         .collect();
-    if user_ids.is_empty() {
+
+    // Thread participants, minus the author and minus anyone already
+    // receiving a mention for this comment.
+    if let Ok(thread) = comments.list(doc_id, true).await {
+        let mut seen: Vec<Uuid> = mentioned.clone();
+        seen.push(author_id);
+        for c in thread.into_iter().filter(|c| c.thread_id == thread_id) {
+            if seen.contains(&c.author_id) {
+                continue;
+            }
+            seen.push(c.author_id);
+            batch.push(knot_storage::NewNotification {
+                workspace_id: doc.workspace_id,
+                user_id: c.author_id,
+                actor_id: Some(author_id),
+                kind: knot_storage::NotificationKind::Reply,
+                doc_id: Some(doc_id),
+                target_kind: "comment".into(),
+                target_id: comment_id.to_string(),
+                dedupe_key: format!("reply:{comment_id}"),
+                data: base_data.clone(),
+            });
+        }
+    }
+
+    if batch.is_empty() {
         return;
     }
-    let payload = serde_json::json!({
-        "type": "mention",
-        "doc_id": doc_id,
-        "comment_id": comment_id,
-        "user_ids": user_ids,
-    });
-    let payload_str = payload.to_string();
-    // Fire and forget — don't fail the request on notify errors.
-    let pool = ctx.clone();
-    tokio::spawn(async move {
-        let _ = sqlx::query("SELECT pg_notify('comment_mentions', $1)")
-            .bind(&payload_str)
-            .execute(&pool)
-            .await;
-    });
+    if let Err(e) = notifications.emit_many(&batch).await {
+        tracing::warn!(error=?e, %comment_id, "emit comment notifications");
+    }
 }
 
 /// Fire-and-forget: tell any active room for `doc_id` that its comments changed,
-/// so connected clients refetch. Mirrors `broadcast_mentions`' pool access.
+/// so connected clients refetch. Reads `state.pool` directly, same as the
+/// notification path reads its individual stores.
 fn notify_comment_change(state: &AppState, doc_id: Uuid) {
     let Some(pool) = state.pool.as_ref().cloned() else {
         return;
@@ -284,9 +328,18 @@ async fn create_thread(
     {
         Ok(c) => {
             let comment_id = c.id;
+            let c_thread_id = c.thread_id;
             let body_text = c.body.clone();
             let response = (StatusCode::CREATED, Json(c)).into_response();
-            broadcast_mentions(&state, doc_id, comment_id, &body_text).await;
+            emit_comment_notifications(
+                &state,
+                doc_id,
+                c_thread_id,
+                comment_id,
+                ctx.user_id,
+                &body_text,
+            )
+            .await;
             notify_comment_change(&state, doc_id);
             response
         }
@@ -336,9 +389,18 @@ async fn create_reply(
     {
         Ok(c) => {
             let comment_id = c.id;
+            let c_thread_id = c.thread_id;
             let body_text = c.body.clone();
             let response = (StatusCode::CREATED, Json(c)).into_response();
-            broadcast_mentions(&state, doc_id, comment_id, &body_text).await;
+            emit_comment_notifications(
+                &state,
+                doc_id,
+                c_thread_id,
+                comment_id,
+                ctx.user_id,
+                &body_text,
+            )
+            .await;
             notify_comment_change(&state, doc_id);
             response
         }
@@ -604,9 +666,18 @@ async fn edit_comment(
         Ok(c) => {
             let comment_id_val = c.id;
             let doc_id_val = c.doc_id;
+            let thread_id_val = c.thread_id;
             let body_text = c.body.clone();
             let response = Json(c).into_response();
-            broadcast_mentions(&state, doc_id_val, comment_id_val, &body_text).await;
+            emit_comment_notifications(
+                &state,
+                doc_id_val,
+                thread_id_val,
+                comment_id_val,
+                ctx.user_id,
+                &body_text,
+            )
+            .await;
             notify_comment_change(&state, doc_id);
             response
         }
