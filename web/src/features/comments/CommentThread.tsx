@@ -191,7 +191,8 @@ export function CommentThread({ docId, threadId, root, replies }: Props) {
   });
 
   const replyMutation = useMutation({
-    mutationFn: (body: string) => commentsApi.reply(docId, threadId, body),
+    mutationFn: (v: { body: string; mentions: string[] }) =>
+      commentsApi.reply(docId, threadId, v.body, v.mentions),
     onSuccess: async (r) => {
       if ("error" in r) { notify("error", "Couldn't post reply"); return; }
       await qc.invalidateQueries({ queryKey: ["comments", docId] });
@@ -298,7 +299,7 @@ export function CommentThread({ docId, threadId, root, replies }: Props) {
           placeholder="Reply…"
           submitLabel="Reply"
           isPending={replyMutation.isPending}
-          onSubmit={(body) => replyMutation.mutate(body)}
+          onSubmit={(body, mentions) => replyMutation.mutate({ body, mentions })}
           data-testid-input={`comment-composer-input-reply-${threadId}`}
           data-testid-submit={`comment-composer-submit-reply-${threadId}`}
         />

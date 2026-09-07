@@ -6,7 +6,7 @@ interface Props {
   placeholder?: string;
   submitLabel?: string;
   isPending?: boolean;
-  onSubmit: (body: string) => void;
+  onSubmit: (body: string, mentions: string[]) => void;
   "data-testid-input"?: string;
   "data-testid-submit"?: string;
 }
@@ -20,14 +20,18 @@ export function CommentComposer({
   "data-testid-submit": testidSubmit,
 }: Props) {
   const [body, setBody] = useState("");
-  const { textareaProps, picker } = useMentionPicker(body, setBody);
+  const [mentions, setMentions] = useState<string[]>([]);
+  const { textareaProps, picker } = useMentionPicker(body, setBody, (id) =>
+    setMentions((prev) => (prev.includes(id) ? prev : [...prev, id])),
+  );
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     const trimmed = body.trim();
     if (!trimmed) return;
-    onSubmit(trimmed);
+    onSubmit(trimmed, mentions);
     setBody("");
+    setMentions([]);
   }
 
   return (

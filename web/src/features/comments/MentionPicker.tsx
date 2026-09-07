@@ -29,7 +29,11 @@ function parseMention(value: string, cursorPos: number): MentionState | null {
   return { query, atOffset: i };
 }
 
-export function useMentionPicker(value: string, onChange: (v: string) => void) {
+export function useMentionPicker(
+  value: string,
+  onChange: (v: string) => void,
+  onPickUser?: (userId: string) => void,
+) {
   const [cursor, setCursor] = useState(0);
   const [highlightIndex, setHighlightIndex] = useState(0);
 
@@ -49,11 +53,12 @@ export function useMentionPicker(value: string, onChange: (v: string) => void) {
       )
     : [];
 
-  function pick(displayName: string) {
+  function pick(member: { user_id: string; display_name: string }) {
     if (!mention) return;
     const before = value.slice(0, mention.atOffset);
     const after = value.slice(cursor);
-    onChange(before + `@${displayName} ` + after);
+    onChange(before + `@${member.display_name} ` + after);
+    onPickUser?.(member.user_id);
     setHighlightIndex(0);
   }
 
@@ -78,7 +83,7 @@ export function useMentionPicker(value: string, onChange: (v: string) => void) {
         const picked = filtered[highlightIndex];
         if (picked) {
           e.preventDefault();
-          pick(picked.display_name);
+          pick(picked);
         }
       } else if (e.key === "Escape") {
         e.preventDefault();
@@ -98,7 +103,8 @@ export function useMentionPicker(value: string, onChange: (v: string) => void) {
           key={m.user_id}
           role="option"
           aria-selected={i === highlightIndex}
-          onMouseDown={(e) => { e.preventDefault(); pick(m.display_name); }}
+          data-testid="mention-item"
+          onMouseDown={(e) => { e.preventDefault(); pick(m); }}
           className={`px-3 py-2 cursor-pointer text-sm ${
             i === highlightIndex ? "bg-muted text-fg" : "text-fg hover:bg-muted/60"
           }`}

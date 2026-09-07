@@ -63,13 +63,14 @@ export function CommentSidebar({ docId }: { docId: string }) {
   });
 
   const createThread = useMutation({
-    mutationFn: (body: string) =>
+    mutationFn: (v: { body: string; mentions: string[] }) =>
       commentsApi.createThread(
         docId,
-        body,
+        v.body,
         pendingAnchor?.positionY ?? null,
         pendingAnchor?.positionYEnd ?? null,
         pendingAnchor?.anchorText ?? null,
+        v.mentions,
       ),
     onSuccess: async (r) => {
       if ("error" in r) { notify("error", "Couldn't post comment"); return; }
@@ -118,7 +119,7 @@ export function CommentSidebar({ docId }: { docId: string }) {
             placeholder="Start a new thread…"
             submitLabel="Comment"
             isPending={createThread.isPending}
-            onSubmit={(body) => createThread.mutate(body)}
+            onSubmit={(body, mentions) => createThread.mutate({ body, mentions })}
             data-testid-input="comment-composer-input-new"
             data-testid-submit="comment-composer-submit-new"
           />
