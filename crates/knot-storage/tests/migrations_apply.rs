@@ -38,6 +38,7 @@ async fn migrations_apply_cleanly() {
         "doc_updates",
         "document_grants",
         "documents",
+        "notifications",
         "sessions",
         "share_tokens",
         "users",
