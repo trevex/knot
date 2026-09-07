@@ -30,6 +30,7 @@ pub mod board_room_shim;
 pub mod comments_listener;
 pub mod http_error;
 pub mod metrics;
+pub mod notifications_sweep;
 pub mod protocol;
 pub mod reindex;
 pub mod room;
