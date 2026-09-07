@@ -121,34 +121,11 @@ impl PgNotificationStore {
         Self { pool }
     }
 
+    /// Exposed so tests can issue ad hoc SQL (backdating rows, hard-deleting
+    /// a document to prove the FK cascade) without this store carrying
+    /// test-only production methods.
     pub fn pool(&self) -> &PgPool {
         &self.pool
-    }
-
-    /// Test-only: backdate a row and optionally mark it read, so `prune`
-    /// can be exercised without waiting 90 days.
-    pub async fn set_ages_for_test(&self, id: i64, days_old: i64, read: bool) -> Result<()> {
-        sqlx::query(
-            "UPDATE notifications \
-             SET created_at = now() - ($2 || ' days')::interval, \
-                 read_at = CASE WHEN $3 THEN now() - ($2 || ' days')::interval ELSE NULL END \
-             WHERE id = $1",
-        )
-        .bind(id)
-        .bind(days_old.to_string())
-        .bind(read)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// Test-only: hard-delete a document to prove the FK cascade.
-    pub async fn hard_delete_doc_for_test(&self, doc_id: Uuid) -> Result<()> {
-        sqlx::query("DELETE FROM documents WHERE id = $1")
-            .bind(doc_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
     }
 }
 

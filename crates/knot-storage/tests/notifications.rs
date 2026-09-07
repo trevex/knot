@@ -48,6 +48,35 @@ async fn setup() -> (PgNotificationStore, Uuid, Uuid, Uuid, Uuid) {
     )
 }
 
+/// Backdate a row and optionally mark it read, so `prune` can be exercised
+/// without waiting 90 days. Issued directly against the pool rather than
+/// through a test-only method on `PgNotificationStore`, since that store is
+/// production API surface.
+async fn backdate(store: &PgNotificationStore, id: i64, days_old: i64, read: bool) {
+    sqlx::query(
+        "UPDATE notifications \
+         SET created_at = now() - ($2 || ' days')::interval, \
+             read_at = CASE WHEN $3 THEN now() - ($2 || ' days')::interval ELSE NULL END \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(days_old.to_string())
+    .bind(read)
+    .execute(store.pool())
+    .await
+    .unwrap();
+}
+
+/// Hard-delete a document to prove the FK cascade, issued directly against
+/// the pool rather than through a test-only method on `PgNotificationStore`.
+async fn hard_delete_doc(store: &PgNotificationStore, doc_id: Uuid) {
+    sqlx::query("DELETE FROM documents WHERE id = $1")
+        .bind(doc_id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+}
+
 fn mention_for(
     ws: Uuid,
     doc: Uuid,
@@ -125,6 +154,9 @@ async fn unread_count_caps_and_mark_read_clears() {
             .unwrap();
     }
     assert_eq!(store.unread_count(bob, 100).await.unwrap(), 3);
+    // The cap actually binds: with 3 unread rows, a cap below that count
+    // must clip the result rather than merely bounding it from above.
+    assert_eq!(store.unread_count(bob, 2).await.unwrap(), 2);
 
     let rows = store.list(bob, true, 50, None).await.unwrap();
     let first = rows[0].id;
@@ -180,18 +212,9 @@ async fn prune_drops_read_rows_past_ninety_days_and_everything_past_one_eighty()
     // Row 0: read, 100 days old  -> pruned.
     // Row 1: unread, 100 days old -> kept.
     // Row 2: unread, 200 days old -> pruned.
-    store
-        .set_ages_for_test(rows[0].id, 100, true)
-        .await
-        .unwrap();
-    store
-        .set_ages_for_test(rows[1].id, 100, false)
-        .await
-        .unwrap();
-    store
-        .set_ages_for_test(rows[2].id, 200, false)
-        .await
-        .unwrap();
+    backdate(&store, rows[0].id, 100, true).await;
+    backdate(&store, rows[1].id, 100, false).await;
+    backdate(&store, rows[2].id, 200, false).await;
 
     assert_eq!(store.prune(chrono::Utc::now()).await.unwrap(), 2);
     let left = store.list(bob, false, 50, None).await.unwrap();
@@ -206,6 +229,6 @@ async fn deleting_a_doc_cascades_its_notifications() {
         .emit(&mention_for(ws, doc, bob, alice, Uuid::new_v4()))
         .await
         .unwrap();
-    store.hard_delete_doc_for_test(doc).await.unwrap();
+    hard_delete_doc(&store, doc).await;
     assert!(store.list(bob, false, 50, None).await.unwrap().is_empty());
 }
