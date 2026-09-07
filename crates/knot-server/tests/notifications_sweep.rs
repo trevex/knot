@@ -4,10 +4,11 @@
 use chrono::{Duration, Utc};
 use knot_server::notifications_sweep;
 use knot_storage::{
-    DocStore, DocTaskInput, NotificationStore, PgDocStore, PgNotificationStore, PgTaskStore,
-    PgUserStore, PgWorkspaceStore, TaskStore, UserStore, WorkspaceRole, WorkspaceStore,
-    sort_key_between,
+    DocStore, DocTaskInput, NewNotification, NotificationKind, NotificationStore, PgDocStore,
+    PgNotificationStore, PgTaskStore, PgUserStore, PgWorkspaceStore, TaskStore, UserStore,
+    WorkspaceRole, WorkspaceStore, sort_key_between,
 };
+use uuid::Uuid;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn overdue_task_emits_once_per_day_even_across_concurrent_sweeps() {
@@ -135,4 +136,78 @@ async fn a_checked_task_is_never_overdue() {
         .await
         .unwrap();
     assert_eq!(out.due_emitted, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn run_once_prunes_via_the_notification_store_and_reports_the_count() {
+    let pool = knot_test_support::fresh_db().await.pool;
+    let ws = PgWorkspaceStore::new(pool.clone())
+        .create("default", "W")
+        .await
+        .unwrap();
+    let alice = PgUserStore::new(pool.clone())
+        .create_local("alice@x.test", "Alice", "$h$")
+        .await
+        .unwrap();
+    let bob = PgUserStore::new(pool.clone())
+        .create_local("bob@x.test", "Bob", "$h$")
+        .await
+        .unwrap();
+    let ws_store = PgWorkspaceStore::new(pool.clone());
+    ws_store
+        .add_member(ws.id, alice.id, WorkspaceRole::Owner)
+        .await
+        .unwrap();
+    ws_store
+        .add_member(ws.id, bob.id, WorkspaceRole::Editor)
+        .await
+        .unwrap();
+    let doc = PgDocStore::new(pool.clone())
+        .create(ws.id, None, "Doc", &sort_key_between(None, None), alice.id)
+        .await
+        .unwrap();
+
+    let notifications = PgNotificationStore::new(pool.clone());
+    notifications
+        .emit(&NewNotification {
+            workspace_id: ws.id,
+            user_id: bob.id,
+            actor_id: Some(alice.id),
+            kind: NotificationKind::Mention,
+            doc_id: Some(doc.id),
+            target_kind: "comment".into(),
+            target_id: Uuid::new_v4().to_string(),
+            dedupe_key: format!("mention:{}", Uuid::new_v4()),
+            data: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    let row_id = notifications.list(bob.id, false, 50, None).await.unwrap()[0].id;
+
+    // Backdate past the 180-day everything-goes threshold. Issued as raw
+    // SQL against the pool directly — mirroring the `backdate` helper in
+    // crates/knot-storage/tests/notifications.rs — rather than
+    // reintroducing a test-only method on `PgNotificationStore`, which was
+    // deliberately removed from that production type in Task 1.
+    sqlx::query("UPDATE notifications SET created_at = now() - interval '200 days' WHERE id = $1")
+        .bind(row_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let out = notifications_sweep::run_once(&pool, Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(
+        out.pruned, 1,
+        "SweepOutcome.pruned must reflect the row prune deleted"
+    );
+    assert!(
+        notifications
+            .list(bob.id, false, 50, None)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the backdated row must actually be gone"
+    );
 }

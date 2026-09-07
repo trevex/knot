@@ -22,11 +22,20 @@ pub struct SweepOutcome {
 /// The dedupe key carries the date, so an overdue task notifies once a day
 /// rather than once every fifteen minutes.
 pub async fn run_once(pool: &PgPool, now: DateTime<Utc>) -> Result<SweepOutcome, sqlx::Error> {
+    // The date half of the dedupe key is computed here, in Rust, from `now`
+    // — not with `to_char(...)` in SQL. `to_char` renders using the
+    // connection's session `TimeZone` GUC, which nothing in this repo ever
+    // sets; today every replica happens to inherit the same server default
+    // so the key is stable, but that's incidental, not enforced. Binding a
+    // pre-formatted date string makes the key a pure function of `now`,
+    // matching the design's claim that correctness lives entirely in the
+    // unique index, not in ambient session state.
+    let date = now.format("%Y-%m-%d").to_string();
     let emitted = sqlx::query(
         "INSERT INTO notifications \
            (workspace_id, user_id, actor_id, kind, doc_id, target_kind, target_id, dedupe_key, data) \
          SELECT t.workspace_id, t.assignee_user_id, NULL, 'task_due', t.doc_id, 'task', t.id, \
-                'task_due:' || t.id || ':' || to_char($1::timestamptz, 'YYYY-MM-DD'), \
+                'task_due:' || t.id || ':' || $2, \
                 jsonb_build_object('text', t.text, 'due_at', t.due_at) \
          FROM doc_tasks t \
          WHERE t.assignee_user_id IS NOT NULL \
@@ -36,6 +45,7 @@ pub async fn run_once(pool: &PgPool, now: DateTime<Utc>) -> Result<SweepOutcome,
          ON CONFLICT (user_id, dedupe_key) DO NOTHING",
     )
     .bind(now)
+    .bind(&date)
     .execute(pool)
     .await?
     .rows_affected();
