@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
+import type { ApiResult } from "../../lib/api";
 import { notificationsApi, type NotificationList, type UnreadCount } from "../../lib/notifications.api";
 
 /** Delivery is polling, not push — see the spec's §6. Window focus covers
@@ -11,14 +12,25 @@ export function formatBadge(count: number, capped: boolean): string {
   return capped ? "99+" : String(count);
 }
 
+/** Unwraps an ApiResult, throwing on error. The thrown value carries the
+ *  HTTP `status` (and `code`) from the API error so that
+ *  `queryClient`'s retry predicate — which keys off `"status" in error` —
+ *  can see it and correctly skip retries on 4xx responses. A bare
+ *  `new Error(message)` would defeat that predicate silently. */
+export function unwrapResult<T>(res: ApiResult<T>): T {
+  if ("error" in res) {
+    throw Object.assign(new Error(res.error.message), {
+      status: res.error.status,
+      code: res.error.code,
+    });
+  }
+  return res.ok;
+}
+
 export function useUnreadCount() {
   return useQuery<UnreadCount>({
     queryKey: ["notifications", "unread_count"],
-    queryFn: async () => {
-      const res = await notificationsApi.unreadCount();
-      if ("error" in res) throw new Error(res.error.message);
-      return res.ok;
-    },
+    queryFn: async () => unwrapResult(await notificationsApi.unreadCount()),
     refetchInterval: POLL_INTERVAL_MS,
     refetchOnWindowFocus: true,
   });
@@ -27,11 +39,7 @@ export function useUnreadCount() {
 export function useNotificationList(filter: "all" | "unread") {
   return useQuery<NotificationList>({
     queryKey: ["notifications", "list", filter],
-    queryFn: async () => {
-      const res = await notificationsApi.list(filter);
-      if ("error" in res) throw new Error(res.error.message);
-      return res.ok;
-    },
+    queryFn: async () => unwrapResult(await notificationsApi.list(filter)),
   });
 }
 
@@ -39,10 +47,9 @@ export function useMarkRead() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: async (ids: number[] | "all") => {
-      const res = ids === "all"
-        ? await notificationsApi.markAllRead()
-        : await notificationsApi.markRead(ids);
-      if ("error" in res) throw new Error(res.error.message);
+      unwrapResult(
+        ids === "all" ? await notificationsApi.markAllRead() : await notificationsApi.markRead(ids),
+      );
     },
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: ["notifications"] });
