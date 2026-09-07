@@ -1,13 +1,16 @@
-import { CheckSquare, LayoutTemplate, Search, Settings, Users } from "lucide-react";
+import { Bell, CheckSquare, LayoutTemplate, Search, Settings, Users } from "lucide-react";
 import { Link } from "react-router-dom";
 
 import { useSession } from "../../auth/SessionContext";
 import { useUi } from "../../stores/ui";
+import { useUnreadCount, formatBadge } from "../notifications/useNotifications";
 
 export function WorkspaceHeader() {
   const session = useSession();
   const user = session.data && "ok" in session.data ? session.data.ok : null;
   const openPalette = useUi((s) => s.openPalette);
+  const unread = useUnreadCount();
+  const badge = unread.data ? formatBadge(unread.data.count, unread.data.capped) : "";
 
   const initial = (user?.display_name ?? "?").slice(0, 1).toUpperCase();
 
@@ -36,6 +39,21 @@ export function WorkspaceHeader() {
         <span className="ml-auto text-[11px] text-fg-muted/80">⌘K</span>
       </button>
       <nav className="mt-2 flex flex-col gap-0.5">
+        <Link
+          to="/notifications"
+          data-testid="sidebar-inbox"
+          className="inline-flex items-center gap-2 h-7 px-2 rounded text-[13px] text-fg-muted hover:text-fg hover:bg-muted transition-colors ease-swift duration-150"
+        >
+          <Bell size={14} aria-hidden /> Inbox
+          {badge !== "" && (
+            <span
+              data-testid="inbox-badge"
+              className="ml-auto min-w-[18px] px-1 h-[18px] rounded-full bg-accent text-accent-fg text-[11px] font-semibold inline-flex items-center justify-center"
+            >
+              {badge}
+            </span>
+          )}
+        </Link>
         <Link
           to="/tasks"
           data-testid="sidebar-tasks"
