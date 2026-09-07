@@ -138,9 +138,21 @@ fn extract_mentions(body: &str) -> Vec<String> {
         .collect()
 }
 
-/// Write inbox rows for a new comment: `mention` for everyone named in the
-/// body, `reply` for the thread's other participants. A user who is both
-/// gets the mention only.
+/// Distinguishes a brand-new comment (thread open or reply) from an edit of
+/// an existing one, for `emit_comment_notifications`. An edit is not a
+/// reply — nobody said anything new to the thread — so it must not fan out
+/// `reply` rows the way a new comment does; it can still add `mention`
+/// rows, since the edited body may name someone for the first time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommentWrite {
+    Created,
+    Edited,
+}
+
+/// Write inbox rows for a comment write: `mention` for everyone named in the
+/// body, plus (for a newly created comment only — see [`CommentWrite`])
+/// `reply` for the thread's other participants. A user who is both gets the
+/// mention only.
 ///
 /// Runs after the comment has committed, so a crash in between loses the
 /// notification. That is the same at-most-once behaviour the previous
@@ -152,6 +164,7 @@ async fn emit_comment_notifications(
     comment_id: Uuid,
     author_id: Uuid,
     body: &str,
+    write: CommentWrite,
 ) {
     let (Some(notifications), Some(docs), Some(workspaces), Some(comments)) = (
         state.notifications.clone(),
@@ -202,8 +215,13 @@ async fn emit_comment_notifications(
         .collect();
 
     // Thread participants, minus the author and minus anyone already
-    // receiving a mention for this comment.
-    if let Ok(thread) = comments.list(doc_id, true).await {
+    // receiving a mention for this comment. Only for a newly created
+    // comment: editing an existing one is not a reply, and re-running this
+    // fan-out on every edit would falsely tell participants someone just
+    // replied.
+    if write == CommentWrite::Created
+        && let Ok(thread) = comments.list(doc_id, true).await
+    {
         let mut seen: Vec<Uuid> = mentioned.clone();
         seen.push(author_id);
         for c in thread.into_iter().filter(|c| c.thread_id == thread_id) {
@@ -338,6 +356,7 @@ async fn create_thread(
                 comment_id,
                 ctx.user_id,
                 &body_text,
+                CommentWrite::Created,
             )
             .await;
             notify_comment_change(&state, doc_id);
@@ -399,6 +418,7 @@ async fn create_reply(
                 comment_id,
                 ctx.user_id,
                 &body_text,
+                CommentWrite::Created,
             )
             .await;
             notify_comment_change(&state, doc_id);
@@ -676,6 +696,7 @@ async fn edit_comment(
                 comment_id_val,
                 ctx.user_id,
                 &body_text,
+                CommentWrite::Edited,
             )
             .await;
             notify_comment_change(&state, doc_id);
