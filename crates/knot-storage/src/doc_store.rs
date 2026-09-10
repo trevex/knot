@@ -79,7 +79,9 @@ pub trait DocStore: Send + Sync + 'static {
         doc_id: Uuid,
         actor: Uuid,
     ) -> Result<(), DocStoreError>;
-    /// Returns siblings under `parent_id` in sort order (alive only).
+    /// Returns siblings under `parent_id` in sort order, archived ones
+    /// included -- they still hold their sort_key, and the UNIQUE index over
+    /// (workspace_id, parent_id, sort_key) still counts them.
     async fn siblings(
         &self,
         workspace_id: Uuid,
@@ -425,10 +427,13 @@ impl DocStore for PgDocStore {
         workspace_id: Uuid,
         parent_id: Option<Uuid>,
     ) -> Result<Vec<Document>, DocStoreError> {
+        // Archived rows are included on purpose: they keep their sort_key and
+        // still count towards UNIQUE (workspace_id, parent_id, sort_key), so a
+        // caller generating the next key must see them or it can regenerate a
+        // key an archived sibling still holds.
         let rows = sqlx::query_as::<_, DocRow>(AssertSqlSafe(format!(
             "SELECT {COLS} FROM documents
              WHERE workspace_id = $1 AND parent_id IS NOT DISTINCT FROM $2
-                   AND archived_at IS NULL
              ORDER BY sort_key"
         )))
         .bind(workspace_id)
