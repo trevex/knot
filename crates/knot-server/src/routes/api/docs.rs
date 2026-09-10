@@ -160,6 +160,12 @@ async fn create(State(state): State<AppState>, req: Request) -> Response {
         .await
     {
         Ok(d) => (StatusCode::CREATED, Json(to_response(&d))).into_response(),
+        // The generated sort_key collided with a sibling's (see move_to for
+        // the same case). That is a client-visible conflict, not an internal
+        // failure — retrying with a different position can succeed.
+        Err(knot_storage::DocStoreError::Conflict) => {
+            json_err(StatusCode::CONFLICT, "doc.sort_key_conflict", "")
+        }
         Err(e) => {
             tracing::error!(error=?e, "create");
             internal()
@@ -524,6 +530,9 @@ async fn create_from_template_inline(
         .await
     {
         Ok(d) => d,
+        Err(knot_storage::DocStoreError::Conflict) => {
+            return json_err(StatusCode::CONFLICT, "doc.sort_key_conflict", "");
+        }
         Err(e) => {
             tracing::error!(error=?e, "from_template create");
             return internal();
