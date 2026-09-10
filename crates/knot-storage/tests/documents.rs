@@ -214,3 +214,27 @@ async fn heal_query_promotes_cycle_members_to_root() {
     assert_eq!(all.len(), 2);
     assert!(all.iter().all(|d| d.parent_id.is_none()));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn siblings_include_archived_so_sort_keys_are_not_reused() {
+    let (store, ws, user) = setup().await;
+    let parent = store.create(ws, None, "P", "m", user).await.unwrap();
+    let child = store
+        .create(ws, Some(parent.id), "C", "m", user)
+        .await
+        .unwrap();
+    store.archive(ws, child.id, user).await.unwrap();
+
+    // The archived child keeps its sort_key and still counts towards
+    // UNIQUE (workspace_id, parent_id, sort_key). If generation cannot see
+    // it, the next subpage regenerates "m" and the INSERT conflicts.
+    let sibs = store.siblings(ws, Some(parent.id)).await.unwrap();
+    assert_eq!(sibs.len(), 1, "archived siblings must stay visible here");
+
+    let next = sort_key_between(None, sibs.first().map(|d| d.sort_key.as_str()));
+    assert_ne!(next, child.sort_key);
+    store
+        .create(ws, Some(parent.id), "C2", &next, user)
+        .await
+        .unwrap();
+}
